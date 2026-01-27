@@ -70,13 +70,17 @@ def fix_box_overlaps_with_vision(
     threshold: int = 200,
     scan_top_ratio: float = 0.3,
     scan_bottom_ratio: float = 0.7,
+    edge_scan_px: int | None = None,
 ) -> list[dict]:
     """
-    Use pixel scanning to push answer boxes rightward if they overlap nearby ink.
+    Use pixel scanning to push answer boxes away from ink under their edges.
 
     This repo stores boxes as normalized {x, y, w, h} values. We scan a thin
-    horizontal strip just to the left of each box, find the right-most ink pixel,
-    and ensure the box starts after that pixel plus padding.
+    horizontal strip centered on the box height, then:
+    - snap to the last letter just left of the box,
+    - move right if ink appears under the left edge,
+    - move left if ink appears under the right edge,
+    - shrink if needed to reduce overlap.
     """
     image_path = Path(image_path)
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -138,36 +142,141 @@ def fix_box_overlaps_with_vision(
         if y_bottom <= y_top:
             continue
 
-        scan_start_x = max(0, x1 - search_width_px)
-        scan_end_x = x1
-        if scan_end_x - scan_start_x < 4:
+        # Build one binary mask over a wider band around the box so we can
+        # query left/outside and inside-edge regions cheaply.
+        band_start_x = max(0, x1 - search_width_px)
+        band_end_x = min(width, x2 + search_width_px)
+        if band_end_x - band_start_x < 8:
             continue
 
-        scan_strip = img[y_top:y_bottom, scan_start_x:scan_end_x]
-        if scan_strip.size == 0:
+        band_strip = img[y_top:y_bottom, band_start_x:band_end_x]
+        if band_strip.size == 0:
             continue
 
         # Threshold for "ink": darker pixels become white (255) in the mask.
-        _, binary = cv2.threshold(scan_strip, threshold, 255, cv2.THRESH_BINARY_INV)
-        coords = cv2.findNonZero(binary)
-        if coords is None:
+        _, band_binary = cv2.threshold(band_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+
+        band_width = band_end_x - band_start_x
+
+        def _region_rel(start_x: int, end_x: int) -> tuple[int, int]:
+            rel_start = _clamp_int(start_x - band_start_x, 0, band_width)
+            rel_end = _clamp_int(end_x - band_start_x, 0, band_width)
+            if rel_end < rel_start:
+                rel_start, rel_end = rel_end, rel_start
+            return rel_start, rel_end
+
+        def _rightmost_ink(start_x: int, end_x: int) -> int | None:
+            rel_start, rel_end = _region_rel(start_x, end_x)
+            if rel_end - rel_start < 2:
+                return None
+            region = band_binary[:, rel_start:rel_end]
+            coords = cv2.findNonZero(region)
+            if coords is None:
+                return None
+            return band_start_x + rel_start + int(np.max(coords[:, 0, 0]))
+
+        def _leftmost_ink(start_x: int, end_x: int) -> int | None:
+            rel_start, rel_end = _region_rel(start_x, end_x)
+            if rel_end - rel_start < 2:
+                return None
+            region = band_binary[:, rel_start:rel_end]
+            coords = cv2.findNonZero(region)
+            if coords is None:
+                return None
+            return band_start_x + rel_start + int(np.min(coords[:, 0, 0]))
+
+        def _ink_count(start_x: int, end_x: int) -> int:
+            rel_start, rel_end = _region_rel(start_x, end_x)
+            if rel_end <= rel_start:
+                return 0
+            return int(np.count_nonzero(band_binary[:, rel_start:rel_end]))
+
+        # How much of each edge to inspect for ink under the box itself.
+        local_edge_scan_px = edge_scan_px
+        if local_edge_scan_px is None or local_edge_scan_px <= 0:
+            local_edge_scan_px = _clamp_int(int((x2 - x1) * 0.35), 20, min(120, x2 - x1))
+        local_edge_scan_px = min(local_edge_scan_px, x2 - x1)
+        if local_edge_scan_px < 6:
             continue
 
-        max_ink_x_local = int(np.max(coords[:, 0, 0]))
-        global_ink_x = scan_start_x + max_ink_x_local
-        # Snap the box to start just after the last detected ink pixel.
-        # This allows both leftward and rightward adjustments, but keeps a
-        # minimum width and never moves beyond the scan window.
-        desired_x1 = global_ink_x + padding_px
-        desired_x1 = max(scan_start_x, desired_x1)
-        desired_x1 = min(desired_x1, x2 - min_width_px)
+        # 1) Snap to the last ink pixel immediately to the left of the box.
+        ext_left_start = max(0, x1 - search_width_px)
+        ext_left_end = x1
+        ext_last_ink = _rightmost_ink(ext_left_start, ext_left_end)
+        desired_x1 = x1
+        if ext_last_ink is not None:
+            desired_x1 = ext_last_ink + padding_px
 
-        if desired_x1 == x1:
-            continue
-        if (x2 - desired_x1) < min_width_px:
+        # 2) If ink exists under the left edge of the box, push right.
+        int_left_start = x1
+        int_left_end = min(x1 + local_edge_scan_px, x2)
+        left_edge_ink = _rightmost_ink(int_left_start, int_left_end)
+        if left_edge_ink is not None:
+            desired_x1 = max(desired_x1, left_edge_ink + padding_px)
+
+        # 3) If ink exists under the right edge of the box, pull left.
+        int_right_start = max(x2 - local_edge_scan_px, x1)
+        int_right_end = x2
+        right_edge_ink = _leftmost_ink(int_right_start, int_right_end)
+        desired_x2 = x2
+        if right_edge_ink is not None:
+            desired_x2 = right_edge_ink - padding_px
+
+        # Clamp desired edges to the band and image bounds.
+        desired_x1 = _clamp_int(desired_x1, 0, width - 1)
+        desired_x2 = _clamp_int(desired_x2, 1, width)
+
+        # Allow shrinking below min_width_px when there is a clear gap between
+        # ink on the left and right edges.
+        gap_span = desired_x2 - desired_x1
+        effective_min_width = min_width_px
+        if 6 < gap_span < min_width_px:
+            effective_min_width = gap_span
+
+        def _candidate_from_edges(x1_c: int, x2_c: int) -> tuple[int, int]:
+            x1_c = _clamp_int(x1_c, 0, width - 1)
+            x2_c = _clamp_int(x2_c, 1, width)
+            if x2_c - x1_c >= effective_min_width:
+                return x1_c, x2_c
+            # Enforce at least the effective minimum width.
+            x2_c = min(width, x1_c + effective_min_width)
+            if x2_c - x1_c < effective_min_width:
+                x1_c = max(0, x2_c - effective_min_width)
+            return x1_c, x2_c
+
+        # Primary candidate: honor both edge constraints.
+        cand_both = _candidate_from_edges(desired_x1, desired_x2)
+
+        # Fallbacks when constraints conflict: move only one side.
+        cand_right = _candidate_from_edges(desired_x1, desired_x1 + min_width_px)
+        cand_left = _candidate_from_edges(desired_x2 - min_width_px, desired_x2)
+
+        candidates = [cand_both, cand_right, cand_left]
+
+        # Choose the candidate with the least ink under the band; tie-break by
+        # smallest movement from the original box.
+        best = None
+        best_key = None
+        for cand_x1, cand_x2 in candidates:
+            if cand_x2 <= cand_x1:
+                continue
+            ink = _ink_count(cand_x1, cand_x2)
+            movement = abs(cand_x1 - x1) + abs(cand_x2 - x2)
+            key = (ink, movement)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (cand_x1, cand_x2)
+
+        if best is None:
             continue
 
-        _update_box_from_pixels(box, desired_x1, x2, width)
+        new_x1, new_x2 = best
+        if new_x1 == x1 and new_x2 == x2:
+            continue
+        if new_x2 - new_x1 < 4:
+            continue
+
+        _update_box_from_pixels(box, new_x1, new_x2, width)
         modified += 1
 
     if modified:
