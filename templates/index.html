@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Workbook Overlay</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div>
+          <span class="badge">Gemini powered overlays</span>
+          <h1>Turn workbook pages into writeable sheets.</h1>
+          <p>
+            Upload a PDF or image (or paste from your clipboard). Gemini finds the answer areas and
+            we overlay text boxes right on the page.
+          </p>
+        </div>
+        <div class="card">
+          <h2>Quick tips</h2>
+          <p class="helper">For best accuracy, use clear scans at 150+ DPI.</p>
+          <p class="helper">PDFs are processed page-by-page (see MAX_PAGES in .env).</p>
+          <p class="helper">Empty answer lines, boxes, or blanks work best.</p>
+        </div>
+      </section>
+
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <div class="flash">{{ messages[0] }}</div>
+        {% endif %}
+      {% endwith %}
+
+      <section class="grid">
+        <div class="card">
+          <h2>Upload PDF or image</h2>
+          <p>Select a file and let Gemini handle the bounding boxes.</p>
+          <form id="upload-form" action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+            <input class="file-input" type="file" name="file" accept="application/pdf,image/*" required />
+            <button class="button" type="submit">Process file</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Paste from clipboard</h2>
+          <p>Click the box, press Ctrl+V, then process the image.</p>
+          <div id="paste-area" class="paste-area" tabindex="0">Paste your image here</div>
+          <img id="paste-preview" class="paste-preview" alt="Clipboard preview" />
+          <div class="divider">clipboard</div>
+          <p id="clipboard-status" class="helper">Waiting for clipboard image.</p>
+          <button id="paste-submit" class="button secondary" type="button" disabled>Process clipboard image</button>
+        </div>
+      </section>
+    </main>
+
+    <div id="processing" class="processing">Processing with Gemini, please wait...</div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Overlay Result</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div>
+          <span class="badge">Job {{ job.job_id }}</span>
+          <h1>Overlay preview</h1>
+          <p>Type directly on top of the page images. Boxes come from {{ job.model }}.</p>
+          <div class="link-row">
+            <a class="button" href="{{ url_for('index') }}">New upload</a>
+            <a class="button secondary" href="{{ url_for('job_json', job_id=job.job_id) }}">View JSON</a>
+          </div>
+        </div>
+      </section>
+
+      {% for page in job.pages %}
+        {% set show_ocr = debug_ocr and page.ocr_words %}
+        <section class="page-card">
+          {% if show_ocr %}
+            <input class="ocr-toggle" id="ocr-{{ job.job_id }}-{{ page.page }}" type="checkbox" checked />
+          {% endif %}
+          <div class="page-header">
+            <h3>Page {{ page.page }}</h3>
+            <div class="page-meta">
+              {% if show_ocr %}
+                {% set ocr_shown = page.ocr_words | length %}
+                {% set ocr_total = page.ocr_words_total or ocr_shown %}
+                <label class="ocr-toggle-label" for="ocr-{{ job.job_id }}-{{ page.page }}">
+                  OCR ({{ ocr_shown }}{% if ocr_total > ocr_shown %}/{{ ocr_total }}{% endif %})
+                </label>
+              {% endif %}
+              {% if page.error %}
+                <span class="error">{{ page.error }}</span>
+              {% endif %}
+            </div>
+          </div>
+          <div class="page-wrap">
+            <img class="page-image" src="{{ url_for('static', filename=page.image) }}" alt="Page {{ page.page }}" />
+            <div class="overlay">
+              {% if show_ocr %}
+                <div class="ocr-layer" aria-hidden="true">
+                  {% for word in page.ocr_words %}
+                    {% set left = (word.x0 * 100) | round(6) %}
+                    {% set top = (word.y0 * 100) | round(6) %}
+                    {% set width = ((word.x1 - word.x0) * 100) | round(6) %}
+                    {% set height = ((word.y1 - word.y0) * 100) | round(6) %}
+                    {% set font_px = ((word.y1 - word.y0) * page.height * 0.8) | round(1) %}
+                    <span
+                      class="ocr-word"
+                      style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%; font-size: clamp(6px, {{ font_px }}px, 18px);"
+                    >{{ word.display }}</span>
+                  {% endfor %}
+                </div>
+              {% endif %}
+              {% for box in page.boxes %}
+                {% set left = (box.x * 100) | round(4) %}
+                {% set top = (box.y * 100) | round(4) %}
+                {% set width = (box.w * 100) | round(4) %}
+                {% set height = (box.h * 100) | round(4) %}
+                {% set anchor = (box.anchor or '') | trim %}
+                {% if box.type == 'answer' %}
+                  <div
+                    class="answer-wrap"
+                    style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
+                    {% if anchor and anchor|lower != 'none' %}data-anchor="{{ anchor }}"{% endif %}
+                  >
+                    {% if box.h > 0.06 %}
+                      <textarea class="answer-input" aria-label="Answer"></textarea>
+                    {% else %}
+                      <input class="answer-input" type="text" aria-label="Answer" />
+                    {% endif %}
+                  </div>
+                {% else %}
+                  <div
+                    class="exercise-box"
+                    style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
+                  ></div>
+                {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+        </section>
+      {% endfor %}
+    </main>
+  </body>
+</html>
