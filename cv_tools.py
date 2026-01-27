@@ -615,23 +615,22 @@ def fix_box_overlaps_with_vision(
                         underline_source = "below"
 
         if underline_y is not None:
-            # Lift the box so its bottom sits on the underline.
-            new_y2 = _clamp_int(underline_y, 1, height)
-            new_y1 = max(0, new_y2 - orig_box_h)
-            cur_y1, cur_y2 = new_y1, new_y2
             _record(
                 "underline_align",
                 cur_x1,
                 cur_x2,
                 cur_y1,
                 cur_y2,
-                note=f"underline_y={underline_y} span={underline_span} source={underline_source}",
+                note=(
+                    f"underline_y={underline_y} span={underline_span} source={underline_source} "
+                    "vertical_align=disabled"
+                ),
             )
         else:
             _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note="no_underline")
 
         # 4) Snap the left edge to the nearest letters on the left using the
-        # current vertical placement (after underline alignment).
+        # current vertical placement (vertical alignment is disabled for now).
         snap_band = _middle_band(cur_y1, cur_y2)
         if snap_band is not None:
             snap_y_top, snap_y_bottom = snap_band
