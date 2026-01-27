@@ -132,6 +132,13 @@ CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
 CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
 CV_EDGE_SCAN_PX = _cv_edge_scan_raw if _cv_edge_scan_raw > 0 else None
+CV_UNDERLINE_ENABLED = os.getenv("CV_UNDERLINE_ENABLED", "1") == "1"
+CV_UNDERLINE_BAND_TOP_RATIO = float(os.getenv("CV_UNDERLINE_BAND_TOP_RATIO", "0.62"))
+CV_UNDERLINE_EXTRA_BOTTOM_PX = int(os.getenv("CV_UNDERLINE_EXTRA_BOTTOM_PX", "10"))
+_cv_underline_margin_raw = int(os.getenv("CV_UNDERLINE_MARGIN_X_PX", "0"))
+CV_UNDERLINE_MARGIN_X_PX = _cv_underline_margin_raw if _cv_underline_margin_raw > 0 else None
+CV_UNDERLINE_ROW_RATIO_MIN = float(os.getenv("CV_UNDERLINE_ROW_RATIO_MIN", "0.02"))
+CV_UNDERLINE_MIN_ROW_PIXELS = int(os.getenv("CV_UNDERLINE_MIN_ROW_PIXELS", "12"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
@@ -1578,6 +1585,12 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
                         scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
+                        underline_enabled=CV_UNDERLINE_ENABLED,
+                        underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
+                        underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
+                        underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
+                        underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
+                        underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (pre-filter) failed on page %s: %s", page_index, exc)
@@ -1614,6 +1627,12 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
                         scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
+                        underline_enabled=CV_UNDERLINE_ENABLED,
+                        underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
+                        underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
+                        underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
+                        underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
+                        underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (post-align) failed on page %s: %s", page_index, exc)

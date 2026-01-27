@@ -54,6 +54,17 @@ def _update_box_from_pixels(box: dict, x1: int, x2: int, width: int) -> None:
     box["w"] = (x2 - x1) / width
 
 
+def _update_box_y_from_pixels(box: dict, y1: int, y2: int, height: int) -> None:
+    """Write pixel y-bounds back into a normalized box while preserving height."""
+    y1 = _clamp_int(y1, 0, height - 1)
+    y2 = _clamp_int(y2, 1, height)
+    if y2 <= y1:
+        return
+
+    box["y"] = y1 / height
+    box["h"] = (y2 - y1) / height
+
+
 def _default_search_width_px(width: int) -> int:
     # ~5% of the page width, bounded to keep scanning fast and consistent.
     return _clamp_int(int(width * 0.05), 40, 140)
@@ -71,16 +82,23 @@ def fix_box_overlaps_with_vision(
     scan_top_ratio: float = 0.3,
     scan_bottom_ratio: float = 0.7,
     edge_scan_px: int | None = None,
+    underline_enabled: bool = True,
+    underline_band_top_ratio: float = 0.62,
+    underline_extra_bottom_px: int = 10,
+    underline_margin_x_px: int | None = None,
+    underline_row_ratio_min: float = 0.02,
+    underline_min_row_pixels: int = 12,
 ) -> list[dict]:
     """
     Use pixel scanning to push answer boxes away from ink under their edges.
 
     This repo stores boxes as normalized {x, y, w, h} values. We scan a thin
     horizontal strip centered on the box height, then:
-    - snap to the last letter just left of the box,
-    - move right if ink appears under the left edge,
-    - move left if ink appears under the right edge,
-    - shrink if needed to reduce overlap.
+    - move left/right if letters are under the box edges,
+    - if an underline/dotted line is behind the box, lift the box so its
+      bottom aligns with that underline,
+    - snap the left edge to the nearest letters on the left,
+    - extend the right edge to the underline length when available.
     """
     image_path = Path(image_path)
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -104,6 +122,10 @@ def fix_box_overlaps_with_vision(
         scan_top_ratio, scan_bottom_ratio = scan_bottom_ratio, scan_top_ratio
     scan_top_ratio = min(max(scan_top_ratio, 0.0), 1.0)
     scan_bottom_ratio = min(max(scan_bottom_ratio, 0.0), 1.0)
+    underline_band_top_ratio = min(max(float(underline_band_top_ratio), 0.0), 1.0)
+    underline_extra_bottom_px = max(0, int(underline_extra_bottom_px))
+    underline_row_ratio_min = max(0.0, float(underline_row_ratio_min))
+    underline_min_row_pixels = max(1, int(underline_min_row_pixels))
 
     # Work on a concrete list and mutate in place for simplicity.
     box_list = list(boxes)
@@ -120,27 +142,33 @@ def fix_box_overlaps_with_vision(
         if bounds is None:
             continue
         x1, y1, x2, y2 = bounds
+        orig_box_h = y2 - y1
 
         if x2 - x1 < min_width_px:
             continue
 
-        # Scan only the middle band of the target box to ignore underlines
-        # (usually near the bottom) and symbols from nearby lines.
-        box_h = y2 - y1
-        band_top = y1 + int(box_h * scan_top_ratio)
-        band_bottom = y1 + int(box_h * scan_bottom_ratio)
-        band_top = _clamp_int(band_top, y1, max(y1, y2 - 1))
-        band_bottom = _clamp_int(band_bottom, min(y2, y1 + 1), y2)
+        def _middle_band(y1_b: int, y2_b: int) -> tuple[int, int] | None:
+            box_h_b = y2_b - y1_b
+            band_top_b = y1_b + int(box_h_b * scan_top_ratio)
+            band_bottom_b = y1_b + int(box_h_b * scan_bottom_ratio)
+            band_top_b = _clamp_int(band_top_b, y1_b, max(y1_b, y2_b - 1))
+            band_bottom_b = _clamp_int(band_bottom_b, min(y2_b, y1_b + 1), y2_b)
 
-        if band_bottom - band_top < 4:
-            mid_y = (y1 + y2) // 2
-            y_top = _clamp_int(mid_y - strip_half_height_px, 0, height - 1)
-            y_bottom = _clamp_int(mid_y + strip_half_height_px, 1, height)
-        else:
-            y_top = band_top
-            y_bottom = band_bottom
-        if y_bottom <= y_top:
+            if band_bottom_b - band_top_b < 4:
+                mid_y_b = (y1_b + y2_b) // 2
+                y_top_b = _clamp_int(mid_y_b - strip_half_height_px, 0, height - 1)
+                y_bottom_b = _clamp_int(mid_y_b + strip_half_height_px, 1, height)
+            else:
+                y_top_b = band_top_b
+                y_bottom_b = band_bottom_b
+            if y_bottom_b <= y_top_b:
+                return None
+            return y_top_b, y_bottom_b
+
+        band = _middle_band(y1, y2)
+        if band is None:
             continue
+        y_top, y_bottom = band
 
         # Build one binary mask over a wider band around the box so we can
         # query left/outside and inside-edge regions cheaply.
@@ -199,22 +227,15 @@ def fix_box_overlaps_with_vision(
         if local_edge_scan_px < 6:
             continue
 
-        # 1) Snap to the last ink pixel immediately to the left of the box.
-        ext_left_start = max(0, x1 - search_width_px)
-        ext_left_end = x1
-        ext_last_ink = _rightmost_ink(ext_left_start, ext_left_end)
-        desired_x1 = x1
-        if ext_last_ink is not None:
-            desired_x1 = ext_last_ink + padding_px
-
-        # 2) If ink exists under the left edge of the box, push right.
+        # 1) If ink exists under the left edge of the box, push right.
         int_left_start = x1
         int_left_end = min(x1 + local_edge_scan_px, x2)
         left_edge_ink = _rightmost_ink(int_left_start, int_left_end)
+        desired_x1 = x1
         if left_edge_ink is not None:
             desired_x1 = max(desired_x1, left_edge_ink + padding_px)
 
-        # 3) If ink exists under the right edge of the box, pull left.
+        # 2) If ink exists under the right edge of the box, pull left.
         int_right_start = max(x2 - local_edge_scan_px, x1)
         int_right_end = x2
         right_edge_ink = _leftmost_ink(int_right_start, int_right_end)
@@ -271,12 +292,104 @@ def fix_box_overlaps_with_vision(
             continue
 
         new_x1, new_x2 = best
-        if new_x1 == x1 and new_x2 == x2:
+        cur_x1, cur_x2 = new_x1, new_x2
+        cur_y1, cur_y2 = y1, y2
+
+        underline_span: tuple[int, int] | None = None
+        underline_y: int | None = None
+
+        if underline_enabled:
+            # 3) Detect underline/dotted line near the bottom and align to it.
+            margin_x = underline_margin_x_px
+            if margin_x is None or margin_x <= 0:
+                margin_x = max(12, min(search_width_px, 220))
+            margin_x = max(0, int(margin_x))
+
+            underline_x1 = max(0, cur_x1 - margin_x)
+            underline_x2 = min(width, cur_x2 + margin_x)
+            underline_y1 = cur_y1 + int(orig_box_h * underline_band_top_ratio)
+            underline_y2 = min(height, cur_y2 + underline_extra_bottom_px)
+            underline_y1 = _clamp_int(underline_y1, cur_y1, max(cur_y1, underline_y2 - 1))
+            underline_y2 = _clamp_int(underline_y2, min(height, underline_y1 + 1), height)
+
+            if underline_y2 - underline_y1 >= 4 and underline_x2 - underline_x1 >= 6:
+                underline_strip = img[underline_y1:underline_y2, underline_x1:underline_x2]
+                _, underline_binary = cv2.threshold(
+                    underline_strip, threshold, 255, cv2.THRESH_BINARY_INV
+                )
+                row_counts = np.count_nonzero(underline_binary, axis=1)
+                if row_counts.size:
+                    peak_idx = int(np.argmax(row_counts))
+                    peak_val = int(row_counts[peak_idx])
+                    min_row_pixels = max(
+                        underline_min_row_pixels,
+                        int((underline_x2 - underline_x1) * underline_row_ratio_min),
+                    )
+                    if peak_val >= min_row_pixels:
+                        # Use a small band around the peak row to estimate the underline span.
+                        row_lo = max(0, peak_idx - 1)
+                        row_hi = min(row_counts.size, peak_idx + 2)
+                        underline_rows = underline_binary[row_lo:row_hi, :]
+                        coords = cv2.findNonZero(underline_rows)
+                        if coords is not None:
+                            local_xs = coords[:, 0, 0]
+                            span_x1 = underline_x1 + int(np.min(local_xs))
+                            span_x2 = underline_x1 + int(np.max(local_xs))
+                            if span_x2 > span_x1:
+                                underline_span = (span_x1, span_x2)
+                                underline_y = underline_y1 + peak_idx
+
+        if underline_y is not None:
+            # Lift the box so its bottom sits on the underline.
+            new_y2 = _clamp_int(underline_y, 1, height)
+            new_y1 = max(0, new_y2 - orig_box_h)
+            cur_y1, cur_y2 = new_y1, new_y2
+
+        # 4) Snap the left edge to the nearest letters on the left using the
+        # current vertical placement (after underline alignment).
+        snap_band = _middle_band(cur_y1, cur_y2)
+        if snap_band is not None:
+            snap_y_top, snap_y_bottom = snap_band
+            snap_start_x = max(0, cur_x1 - search_width_px)
+            snap_end_x = cur_x1
+            if snap_end_x - snap_start_x >= 4:
+                snap_strip = img[snap_y_top:snap_y_bottom, snap_start_x:snap_end_x]
+                if snap_strip.size > 0:
+                    _, snap_binary = cv2.threshold(snap_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+                    snap_coords = cv2.findNonZero(snap_binary)
+                    if snap_coords is not None:
+                        last_ink_local_x = int(np.max(snap_coords[:, 0, 0]))
+                        last_ink_x = snap_start_x + last_ink_local_x
+                        snap_x1 = last_ink_x + padding_px
+                        # Keep enough width.
+                        max_snap_x1 = max(0, cur_x2 - min_width_px)
+                        snap_x1 = min(snap_x1, max_snap_x1)
+                        snap_x1 = _clamp_int(snap_x1, 0, width - 1)
+                        if cur_x2 - snap_x1 >= 4:
+                            cur_x1 = snap_x1
+
+        # 5) Extend to the underline length when we have a span.
+        if underline_span is not None:
+            span_x1, span_x2 = underline_span
+            if span_x2 > cur_x2:
+                cur_x2 = span_x2
+            # Do not move the left edge past the snapped-left position.
+            # If the underline starts to the right, allow moving right slightly.
+            if span_x1 > cur_x1:
+                cur_x1 = min(span_x1, cur_x2 - min_width_px)
+
+        cur_x1 = _clamp_int(cur_x1, 0, width - 1)
+        cur_x2 = _clamp_int(cur_x2, 1, width)
+        if cur_x2 <= cur_x1:
             continue
-        if new_x2 - new_x1 < 4:
+        if cur_x2 - cur_x1 < 4:
             continue
 
-        _update_box_from_pixels(box, new_x1, new_x2, width)
+        if cur_x1 == x1 and cur_x2 == x2 and cur_y1 == y1 and cur_y2 == y2:
+            continue
+
+        _update_box_from_pixels(box, cur_x1, cur_x2, width)
+        _update_box_y_from_pixels(box, cur_y1, cur_y2, height)
         modified += 1
 
     if modified:
