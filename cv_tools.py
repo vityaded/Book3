@@ -395,40 +395,15 @@ def fix_box_overlaps_with_vision(
                 return None
             return y_top_b, y_bottom_b
 
-        cur_x1, cur_x2 = x1, x2
-        cur_y1, cur_y2 = y1, y2
-
-        band = _middle_band(cur_y1, cur_y2)
+        band = _middle_band(y1, y2)
         if band is None:
             continue
         y_top, y_bottom = band
 
-        # 1) snap_left: find anchor using column sums (noise filter).
-        snap_start_x = max(0, cur_x1 - search_width_px)
-        snap_end_x = cur_x1
-        if snap_end_x - snap_start_x >= 4:
-            snap_strip = img[y_top:y_bottom, snap_start_x:snap_end_x]
-            if snap_strip.size > 0:
-                _, snap_binary = cv2.threshold(snap_strip, threshold, 255, cv2.THRESH_BINARY_INV)
-                col_sums = cv2.reduce(snap_binary, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32S)
-                valid_cols = np.where(col_sums.flatten() > (255 * 3))[0]
-                if valid_cols.size > 0:
-                    anchor_x = snap_start_x + int(valid_cols.max())
-                    snap_x1 = anchor_x + padding_px
-                    max_snap_x1 = max(0, cur_x2 - min_width_floor_px)
-                    snap_x1 = min(snap_x1, max_snap_x1)
-                    snap_x1 = _clamp_int(snap_x1, 0, width - 1)
-                    if snap_x1 >= cur_x1:
-                        cur_x1 = snap_x1
-                    else:
-                        # Allow left expansion if anchor is reasonably close.
-                        if (cur_x1 - anchor_x) <= 150:
-                            cur_x1 = snap_x1
-        _record("snap_left", cur_x1, cur_x2, cur_y1, cur_y2)
-
-        # 2) edge_avoid: avoid overlaps after snap_left.
-        band_start_x = max(0, cur_x1 - search_width_px)
-        band_end_x = min(width, cur_x2 + search_width_px)
+        # Build one binary mask over a wider band around the box so we can
+        # query left/outside and inside-edge regions cheaply.
+        band_start_x = max(0, x1 - search_width_px)
+        band_end_x = min(width, x2 + search_width_px)
         if band_end_x - band_start_x < 8:
             continue
 
@@ -436,7 +411,9 @@ def fix_box_overlaps_with_vision(
         if band_strip.size == 0:
             continue
 
+        # Threshold for "ink": darker pixels become white (255) in the mask.
         _, band_binary = cv2.threshold(band_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+
         band_width = band_end_x - band_start_x
 
         def _region_rel(start_x: int, end_x: int) -> tuple[int, int]:
@@ -472,37 +449,36 @@ def fix_box_overlaps_with_vision(
                 return 0
             return int(np.count_nonzero(band_binary[:, rel_start:rel_end]))
 
+        # How much of each edge to inspect for ink under the box itself.
         local_edge_scan_px = edge_scan_px
         if local_edge_scan_px is None or local_edge_scan_px <= 0:
-            local_edge_scan_px = _clamp_int(int((cur_x2 - cur_x1) * 0.05), 5, min(120, cur_x2 - cur_x1))
-        local_edge_scan_px = min(local_edge_scan_px, cur_x2 - cur_x1)
+            local_edge_scan_px = _clamp_int(int((x2 - x1) * 0.05), 5, min(120, x2 - x1))
+        local_edge_scan_px = min(local_edge_scan_px, x2 - x1)
         if local_edge_scan_px < 5:
             continue
 
-        max_shrink = (cur_x2 - cur_x1) * 0.20
-        base_x1, base_x2 = cur_x1, cur_x2
-
-        int_left_start = cur_x1
-        int_left_end = min(cur_x1 + local_edge_scan_px, cur_x2)
+        # 1) If ink exists under the left edge of the box, push right.
+        int_left_start = x1
+        int_left_end = min(x1 + local_edge_scan_px, x2)
         left_edge_ink = _rightmost_ink(int_left_start, int_left_end)
-        desired_x1 = cur_x1
+        desired_x1 = x1
         if left_edge_ink is not None:
             desired_x1 = max(desired_x1, left_edge_ink + padding_px)
-            if (desired_x1 - cur_x1) > max_shrink:
-                desired_x1 = cur_x1
 
-        int_right_start = max(cur_x2 - local_edge_scan_px, cur_x1)
-        int_right_end = cur_x2
+        # 2) If ink exists under the right edge of the box, pull left.
+        int_right_start = max(x2 - local_edge_scan_px, x1)
+        int_right_end = x2
         right_edge_ink = _leftmost_ink(int_right_start, int_right_end)
-        desired_x2 = cur_x2
+        desired_x2 = x2
         if right_edge_ink is not None:
             desired_x2 = right_edge_ink - padding_px
-            if (cur_x2 - desired_x2) > max_shrink:
-                desired_x2 = cur_x2
 
+        # Clamp desired edges to the band and image bounds.
         desired_x1 = _clamp_int(desired_x1, 0, width - 1)
         desired_x2 = _clamp_int(desired_x2, 1, width)
 
+        # Allow shrinking below min_width_px when there is a clear gap between
+        # ink on the left and right edges.
         gap_span = desired_x2 - desired_x1
         effective_min_width = min_width_floor_px
         if 0 < gap_span < effective_min_width:
@@ -513,23 +489,30 @@ def fix_box_overlaps_with_vision(
             x2_c = _clamp_int(x2_c, 1, width)
             if x2_c - x1_c >= effective_min_width:
                 return x1_c, x2_c
+            # Enforce at least the effective minimum width.
             x2_c = min(width, x1_c + effective_min_width)
             if x2_c - x1_c < effective_min_width:
                 x1_c = max(0, x2_c - effective_min_width)
             return x1_c, x2_c
 
+        # Primary candidate: honor both edge constraints.
         cand_both = _candidate_from_edges(desired_x1, desired_x2)
+
+        # Fallbacks when constraints conflict: move only one side.
         cand_right = _candidate_from_edges(desired_x1, desired_x1 + min_width_floor_px)
         cand_left = _candidate_from_edges(desired_x2 - min_width_floor_px, desired_x2)
 
         candidates = [cand_both, cand_right, cand_left]
+
+        # Choose the candidate with the least ink under the band; tie-break by
+        # smallest movement from the original box.
         best = None
         best_key = None
         for cand_x1, cand_x2 in candidates:
             if cand_x2 <= cand_x1:
                 continue
             ink = _ink_count(cand_x1, cand_x2)
-            movement = abs(cand_x1 - base_x1) + abs(cand_x2 - base_x2)
+            movement = abs(cand_x1 - x1) + abs(cand_x2 - x2)
             key = (ink, movement)
             if best_key is None or key < best_key:
                 best_key = key
@@ -538,16 +521,43 @@ def fix_box_overlaps_with_vision(
         if best is None:
             continue
 
-        cur_x1, cur_x2 = best
+        new_x1, new_x2 = best
+        cur_x1, cur_x2 = new_x1, new_x2
+        cur_y1, cur_y2 = y1, y2
+
         edge_note = (
             f"left_edge_ink={left_edge_ink} right_edge_ink={right_edge_ink} "
-            f"max_shrink={max_shrink:.1f} cand_x1={cur_x1} cand_x2={cur_x2}"
+            f"cand_x1={cur_x1} cand_x2={cur_x2}"
         )
         _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note=edge_note)
 
         underline_span: tuple[int, int] | None = None
         underline_y: int | None = None
         underline_source: str | None = None
+
+        # 4) Snap the left edge to the nearest letters on the left using the
+        # current vertical placement (vertical alignment is disabled for now).
+        snap_band = _middle_band(cur_y1, cur_y2)
+        if snap_band is not None:
+            snap_y_top, snap_y_bottom = snap_band
+            snap_start_x = max(0, cur_x1 - search_width_px)
+            snap_end_x = cur_x1
+            if snap_end_x - snap_start_x >= 4:
+                snap_strip = img[snap_y_top:snap_y_bottom, snap_start_x:snap_end_x]
+                if snap_strip.size > 0:
+                    _, snap_binary = cv2.threshold(snap_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+                    snap_coords = cv2.findNonZero(snap_binary)
+                    if snap_coords is not None:
+                        last_ink_local_x = int(np.max(snap_coords[:, 0, 0]))
+                        last_ink_x = snap_start_x + last_ink_local_x
+                        snap_x1 = last_ink_x + padding_px
+                        # Keep enough width.
+                        max_snap_x1 = max(0, cur_x2 - min_width_floor_px)
+                        snap_x1 = min(snap_x1, max_snap_x1)
+                        snap_x1 = _clamp_int(snap_x1, 0, width - 1)
+                        if cur_x2 - snap_x1 >= min_width_floor_px:
+                            cur_x1 = snap_x1
+        _record("snap_left", cur_x1, cur_x2, cur_y1, cur_y2)
 
         # Underline extension is suspended for now.
 
@@ -632,22 +642,6 @@ def fix_box_overlaps_with_vision(
                         underline_span = below_result.get("span")
                         underline_source = "below"
 
-        # Gap guard: if the underline was found below and the gap contains ink,
-        # abort the vertical snap (likely text, not empty space).
-        gap_guard_blocked = False
-        if underline_y is not None and underline_source == "below":
-            gap_y1 = int(cur_y2)
-            gap_y2 = int(underline_y)
-            if gap_y2 > gap_y1 and cur_x2 > cur_x1:
-                gap = img[gap_y1:gap_y2, int(cur_x1):int(cur_x2)]
-                if gap.size > 0:
-                    _, bin_gap = cv2.threshold(gap, 200, 255, cv2.THRESH_BINARY_INV)
-                    density = cv2.countNonZero(bin_gap) / (gap.size + 1e-5)
-                    if density > 0.02:
-                        gap_guard_blocked = True
-                        underline_y = None
-                        underline_source = None
-
         # Last step: align the box bottom to the detected underline, if any.
         if underline_y is not None:
             new_y2 = _clamp_int(underline_y, 1, height)
@@ -662,10 +656,7 @@ def fix_box_overlaps_with_vision(
                 note=f"underline_y={underline_y} span={underline_span} source={underline_source}",
             )
         else:
-            note = "no_underline"
-            if gap_guard_blocked:
-                note = "gap_guard_blocked"
-            _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note=note)
+            _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note="no_underline")
 
         cur_x1 = _clamp_int(cur_x1, 0, width - 1)
         cur_x2 = _clamp_int(cur_x2, 1, width)
