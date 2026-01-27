@@ -145,6 +145,10 @@ CV_UNDERLINE_SEGMENTS_MIN = int(os.getenv("CV_UNDERLINE_SEGMENTS_MIN", "3"))
 CV_UNDERLINE_GAP_CV_MAX = float(os.getenv("CV_UNDERLINE_GAP_CV_MAX", "1.4"))
 CV_UNDERLINE_BELOW_SCAN_PX = int(os.getenv("CV_UNDERLINE_BELOW_SCAN_PX", "28"))
 CV_UNDERLINE_BELOW_MARGIN_TOP_PX = int(os.getenv("CV_UNDERLINE_BELOW_MARGIN_TOP_PX", "2"))
+CV_UNDERLINE_BELOW_RATIO = float(os.getenv("CV_UNDERLINE_BELOW_RATIO", "0.5"))
+CV_UNDERLINE_USE_OTSU = os.getenv("CV_UNDERLINE_USE_OTSU", "1") == "1"
+CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
+CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
@@ -1608,6 +1612,10 @@ def process_page(
                         underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
                         underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
                         underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                        underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
+                        underline_use_otsu=CV_UNDERLINE_USE_OTSU,
+                        underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
+                        underline_threshold=CV_UNDERLINE_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="pre_filter",
                     )
@@ -1657,6 +1665,10 @@ def process_page(
                         underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
                         underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
                         underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                        underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
+                        underline_use_otsu=CV_UNDERLINE_USE_OTSU,
+                        underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
+                        underline_threshold=CV_UNDERLINE_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="post_align",
                     )

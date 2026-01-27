@@ -55,6 +55,7 @@
           </div>
           {% if cv_debug_enabled %}
             <div class="cv-debug-controls" data-cv-controls>
+              <button class="button secondary cv-debug-prev" type="button" data-cv-prev>Previous step</button>
               <button class="button secondary cv-debug-next" type="button" data-cv-next>Next step</button>
               <span class="cv-debug-step" data-cv-step-label></span>
             </div>
@@ -197,12 +198,21 @@
             pageEl.setAttribute("data-cv-step-index", "0");
             applyStepToPage(pageEl, 0);
 
+            const prevBtn = pageEl.querySelector("[data-cv-prev]");
+            if (prevBtn) {
+              prevBtn.addEventListener("click", () => {
+                const current = Number(pageEl.getAttribute("data-cv-step-index") || 0);
+                applyStepToPage(pageEl, current - 1);
+              });
+            }
+
             const nextBtn = pageEl.querySelector("[data-cv-next]");
-            if (!nextBtn) return;
-            nextBtn.addEventListener("click", () => {
-              const current = Number(pageEl.getAttribute("data-cv-step-index") || 0);
-              applyStepToPage(pageEl, current + 1);
-            });
+            if (nextBtn) {
+              nextBtn.addEventListener("click", () => {
+                const current = Number(pageEl.getAttribute("data-cv-step-index") || 0);
+                applyStepToPage(pageEl, current + 1);
+              });
+            }
           });
         });
       </script>
