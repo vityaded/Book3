@@ -226,6 +226,51 @@ def _detect_underline_in_region(
     return None
 
 
+def _is_thin_line(
+    img: np.ndarray,
+    *,
+    x1: int,
+    x2: int,
+    y: int,
+    threshold: int,
+    min_row_pixels: int,
+    max_rows_with_ink: int = 2,
+    center_ratio: float = 0.6,
+) -> bool:
+    """Heuristic: underline/dotted lines are usually 1-2px tall."""
+    height, width = img.shape[:2]
+    if x2 - x1 < 4:
+        return False
+    y0 = max(0, y - 2)
+    y1 = min(height, y + 3)
+    if y1 <= y0:
+        return False
+
+    strip = img[y0:y1, x1:x2]
+    if strip.size == 0:
+        return False
+
+    _, binary = cv2.threshold(strip, threshold, 255, cv2.THRESH_BINARY_INV)
+    row_counts = np.count_nonzero(binary, axis=1)
+    total_ink = int(row_counts.sum())
+    if total_ink == 0:
+        return False
+
+    center_idx = y - y0
+    if center_idx < 0 or center_idx >= row_counts.size:
+        return False
+
+    rows_with_ink = sum(count >= min_row_pixels for count in row_counts)
+    if rows_with_ink > max_rows_with_ink:
+        return False
+
+    center_count = int(row_counts[center_idx])
+    if (center_count / total_ink) < center_ratio:
+        return False
+
+    return True
+
+
 def _default_search_width_px(width: int) -> int:
     # ~5% of the page width, bounded to keep scanning fast and consistent.
     return _clamp_int(int(width * 0.05), 40, 140)
@@ -610,8 +655,13 @@ def fix_box_overlaps_with_vision(
             below_scan_px = underline_below_scan_px
             if underline_below_ratio > 0:
                 below_scan_px = max(below_scan_px, int(orig_box_h * underline_below_ratio))
+            # Cap how far below we look for a line (as a fraction of box height).
+            max_below_px = int(orig_box_h * 0.6)
+            if max_below_px > 0:
+                below_scan_px = min(below_scan_px, max_below_px)
 
-            if underline_y is None and below_scan_px > 0:
+            below_candidate: dict | None = None
+            if below_scan_px > 0:
                 below_x1 = max(0, cur_x1 - margin_x)
                 below_x2 = min(width, cur_x2 + margin_x)
                 below_y1 = min(height - 1, cur_y2 + underline_below_margin_top_px)
@@ -638,9 +688,37 @@ def fix_box_overlaps_with_vision(
                         _min_row_pixels(below_x1, below_x2) / max(below_x2 - below_x1, 1)
                     )
                     if row_pixels_ok:
-                        underline_y = int(below_result["underline_y"])
-                        underline_span = below_result.get("span")
-                        underline_source = "below"
+                        candidate_y = int(below_result["underline_y"])
+                        min_pixels = max(3, int(_min_row_pixels(below_x1, below_x2) * 0.5))
+                        thin_ok = _is_thin_line(
+                            img,
+                            x1=below_x1,
+                            x2=below_x2,
+                            y=candidate_y,
+                            threshold=underline_threshold,
+                            min_row_pixels=min_pixels,
+                            max_rows_with_ink=2,
+                            center_ratio=0.55,
+                        )
+                        if thin_ok:
+                            below_candidate = {
+                                "underline_y": candidate_y,
+                                "span": below_result.get("span"),
+                                "score": float((analysis or {}).get("score", 0.0)),
+                            }
+
+            # Choose the more visible candidate between near and below.
+            if underline_y is not None or below_candidate is not None:
+                near_score = -1.0
+                if underline_y is not None and near_result is not None:
+                    near_score = float((near_result.get("analysis") or {}).get("score", 0.0))
+                below_score = float(below_candidate.get("score", -1.0)) if below_candidate else -1.0
+
+                # Prefer the more visible (higher score).
+                if below_score > near_score:
+                    underline_y = int(below_candidate["underline_y"])
+                    underline_span = below_candidate.get("span")
+                    underline_source = "below"
 
         # Last step: align the box bottom to the detected underline, if any.
         if underline_y is not None:
