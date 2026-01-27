@@ -96,6 +96,7 @@ ANCHOR_RIGHT_TOLERANCE = float(os.getenv("ANCHOR_RIGHT_TOLERANCE", "0.02"))
 ANCHOR_LINE_DY_MAX = float(os.getenv("ANCHOR_LINE_DY_MAX", "0.03"))
 ANCHOR_LINE_DY_MIN = float(os.getenv("ANCHOR_LINE_DY_MIN", "0.01"))
 ANCHOR_LINE_DY_MULT = float(os.getenv("ANCHOR_LINE_DY_MULT", "3.0"))
+ANCHOR_TARGET_PADDING_RATIO = float(os.getenv("ANCHOR_TARGET_PADDING_RATIO", "0.01") or 0.01)
 DEBUG_OCR_LAYER = os.getenv("DEBUG_OCR_LAYER", "0") == "1"
 DEBUG_OCR_LAYER_ALL = os.getenv("DEBUG_OCR_LAYER_ALL", "0") == "1"
 OCR_MIN_WORD_HEIGHT_PX = float(os.getenv("OCR_MIN_WORD_HEIGHT_PX", "0") or 0)
@@ -118,81 +119,83 @@ MIN_BOX_SIZE_PX = 12
 MIN_BOX_AREA_PX = 320
 
 PROMPT_TEMPLATE = """
-Role: You are a Computer Vision and Document Layout Analysis expert.
+Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
 
-Task: Analyze the provided worksheet image(s) to identify every writable area intended for user input.
+For each fillable blank, identify two regions:
+- Anchor: The bounding box of the specific word or symbol immediately to the left of the blank (e.g., "Name:", "1.").
+- Target: The bounding box of the blank space itself.
 
-Definitions: A "writable area" includes:
-- Underlines (solid lines ____).
-- Dotted lines (dotted leaders ....).
-- Character slots (gaps in words for missing letters, e.g., c __ __ n).
-- Blank spaces positioned after a question label or prompt text.
+Coordinate System:
+- Use [ymin, xmin, ymax, xmax] relative to the image dimensions.
+- Scale: 0-1000 (integer values).
 
-Output Requirements: Return ONLY JSON in this format:
-{
-  "boxes": [
-    {
-      "id": "optional",
-      "context_text": "optional",
-      "input_type": "Boolean|Single Word|Sentence|Character",
-      "bbox": [ymin, xmin, ymax, xmax],
-      "type": "answer",
-      "label": "optional",
-      "anchor": "optional",
-      "filled": false
-    }
-  ]
-}
+Return JSON format:
+{"items": [{"anchor_box": [ymin, xmin, ymax, xmax], "target_box": [ymin, xmin, ymax, xmax], "label": "string", "filled": false}]}
 
 Rules:
-- bbox is [ymin, xmin, ymax, xmax] relative to image width/height, using a 0-1000 scale (preferred). If you use a 0-100 scale, add "coord_scale": 100.
-- Return strict JSON only: use double quotes for keys/strings, no trailing commas, no comments, no markdown fences.
-- Do NOT return a box if the blank already contains a printed or handwritten answer/example.
-- Do NOT include surrounding prompt text; boxes should only cover the writable area.
-- Boxes may overlap underline strokes or dotted lines; those are part of the writable area.
-- Multi-line answers: when a single question provides multiple stacked answer lines (two or more underlines directly under the same prompt), return ONE "answer" box that covers the entire multi-line region. Do NOT return one box per line in that case.
-- Avoid overlapping printed letters or punctuation; if overlap would occur, shrink or shift the box while keeping it aligned to the blank.
-- When a blank follows a word/letter on the same line, place the box immediately to the right of that word/letter with a small gap; do not slide far to the right.
-- Keep the box horizontally aligned with the letters in that line and aligned to the text baseline; the bottom of the box should match the bottom of letters on that line.
-- Set the box height to match the height of capital letters on that line (approximate is fine).
-- If an underline/dotted line shows the blank length, match the box width to that line and start it near the line start.
-- "anchor" is OPTIONAL and must be omitted unless a single printed alphanumeric token (letters/digits only) is immediately to the LEFT of the writable blank on the same line (touching or separated by a tiny gap).
-- If present, "anchor" must be exactly that one token and match ^[A-Za-z0-9]+$ (no spaces, punctuation, underscores, dots, or line/blank characters).
-- If the nearest thing left of the blank is punctuation/symbols/underscores/dots/lines OR there is no adjacent token, omit "anchor" (do NOT use "none"/"null").
-- If unsure whether a blank is already filled, mark it as filled: true.
-- If nothing is found, return {"boxes": []}.
-
-Visual Analysis Strategy:
-- Scan for horizontal lines (solid or dotted) that align with text baselines.
-- Detect gaps between letters in "Complete the word" sections.
+- The anchor_box and target_box must refer to the same line and the same blank.
+- The anchor_box should tightly bound only the anchor text/symbol, not the blank.
+- The target_box should tightly bound only the writable blank area.
+- The bottom edge (ymax) of the target_box should align with the text baseline on that line.
+- Use tight heights that match the cap height of the surrounding text.
+- Include filled: true when the blank already contains handwriting or typed text.
+- If no blanks are found, return {"items": []}.
 """.strip()
 
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "anchor_box": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "Anchor box [ymin, xmin, ymax, xmax] on a 0-1000 scale.",
+                    },
+                    "target_box": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "Target blank box [ymin, xmin, ymax, xmax] on a 0-1000 scale.",
+                    },
+                    "label": {"type": "string"},
+                    "filled": {"type": "boolean", "description": "True if the blank is already filled."},
+                },
+                "required": ["target_box"],
+            },
+        },
+        # Backward-compatible path if the model still returns boxes.
         "boxes": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "context_text": {"type": "string"},
-                    "input_type": {"type": "string"},
+                    "box_2d": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
                     "bbox": {
                         "type": "array",
                         "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
                     },
-                    "type": {"type": "string"},
                     "label": {"type": "string"},
-                    "anchor": {"type": "string"},
                     "filled": {"type": "boolean"},
                 },
-                "required": ["bbox"],
             },
         },
         "coord_scale": {"type": "number"},
     },
-    "required": ["boxes"],
+    "required": ["items"],
 }
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -948,6 +951,19 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
     if image_size:
         width, height = image_size
 
+    def extract_box_coords(candidate) -> tuple[float, float, float, float] | None:
+        if not isinstance(candidate, (list, tuple)) or len(candidate) != 4:
+            return None
+        y1 = safe_float(candidate[0])
+        x1 = safe_float(candidate[1])
+        y2 = safe_float(candidate[2])
+        x2 = safe_float(candidate[3])
+        if None in (x1, y1, x2, y2):
+            return None
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
+
     for index, raw in enumerate(raw_boxes, start=1):
         if not isinstance(raw, dict):
             continue
@@ -960,18 +976,19 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         h = safe_float(raw.get("h"))
         coord_scale = safe_float(raw.get("coord_scale") or raw.get("coordinates_scale"))
 
+        anchor_coords = extract_box_coords(raw.get("anchor_box"))
+
         if None in (x, y, w, h):
-            box2d = raw.get("box_2d") or raw.get("bbox") or raw.get("box") or raw.get("coordinates")
-            if isinstance(box2d, (list, tuple)) and len(box2d) == 4:
-                y1 = safe_float(box2d[0])
-                x1 = safe_float(box2d[1])
-                y2 = safe_float(box2d[2])
-                x2 = safe_float(box2d[3])
-                if None not in (x1, y1, x2, y2) and x2 > x1 and y2 > y1:
-                    x = x1
-                    y = y1
-                    w = x2 - x1
-                    h = y2 - y1
+            target_candidate = (
+                raw.get("target_box")
+                or raw.get("box_2d")
+                or raw.get("bbox")
+                or raw.get("box")
+                or raw.get("coordinates")
+            )
+            target_coords = extract_box_coords(target_candidate)
+            if target_coords is not None:
+                x, y, w, h = target_coords
 
         if None in (x, y, w, h):
             continue
@@ -1004,6 +1021,34 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
             x, y, w, h = inset_box(x, y, w, h, BOX_INSET_RATIO)
             if w <= 0 or h <= 0:
                 continue
+
+        # If the model returned an anchor box, enforce that the target starts after it.
+        if anchor_coords is not None and width:
+            ax, ay, aw, ah = anchor_coords
+            ax, ay, aw, ah = normalize_box_values(ax, ay, aw, ah, width, height, coord_scale)
+            ax = min(max(ax, 0.0), 1.0)
+            ay = min(max(ay, 0.0), 1.0)
+            aw = min(max(aw, 0.0), 1.0 - ax)
+            ah = min(max(ah, 0.0), 1.0 - ay)
+            if aw > 0 and ah > 0:
+                # Vertical alignment: match anchor cap-height and baseline.
+                anchor_bottom = min(max(ay + ah, 0.0), 1.0)
+                target_h = min(max(ah, 0.0), anchor_bottom)
+                if target_h > 0:
+                    h = min(target_h, anchor_bottom)
+                    y = clamp(anchor_bottom - h, 0.0, 1.0 - h)
+
+                anchor_xmax = min(max(ax + aw, 0.0), 1.0)
+                padding = max(0.0, ANCHOR_TARGET_PADDING_RATIO)
+                x2 = x + w
+                min_width_norm = max(MIN_BOX_SIZE_PX / width, 0.001)
+                if x2 > min_width_norm:
+                    max_x = max(0.0, x2 - min_width_norm)
+                    new_x = max(x, anchor_xmax + padding)
+                    x = min(max(new_x, 0.0), max_x)
+                    w = x2 - x
+                    if w <= 0:
+                        continue
 
         cleaned.append(
             {
@@ -1498,7 +1543,10 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
         llm_size = llm_image.size
         try:
             raw_response = generate_boxes(llm_image)
-            boxes = sanitize_boxes(raw_response.get("boxes", []), page_index, llm_size)
+            raw_items = raw_response.get("items")
+            if not isinstance(raw_items, list):
+                raw_items = raw_response.get("boxes", [])
+            boxes = sanitize_boxes(raw_items, page_index, llm_size)
             boxes = filter_filled_boxes(image, boxes)
             if not NO_OCR and any(
                 clean_anchor_text(str(box.get("anchor", "")).strip())
