@@ -68,6 +68,8 @@ def fix_box_overlaps_with_vision(
     min_width_px: int = 14,
     strip_half_height_px: int = 6,
     threshold: int = 200,
+    scan_top_ratio: float = 0.3,
+    scan_bottom_ratio: float = 0.7,
 ) -> list[dict]:
     """
     Use pixel scanning to push answer boxes rightward if they overlap nearby ink.
@@ -92,6 +94,12 @@ def fix_box_overlaps_with_vision(
     padding_px = max(0, int(padding_px))
     min_width_px = max(1, int(min_width_px))
     strip_half_height_px = max(2, int(strip_half_height_px))
+    scan_top_ratio = float(scan_top_ratio)
+    scan_bottom_ratio = float(scan_bottom_ratio)
+    if scan_bottom_ratio < scan_top_ratio:
+        scan_top_ratio, scan_bottom_ratio = scan_bottom_ratio, scan_top_ratio
+    scan_top_ratio = min(max(scan_top_ratio, 0.0), 1.0)
+    scan_bottom_ratio = min(max(scan_bottom_ratio, 0.0), 1.0)
 
     # Work on a concrete list and mutate in place for simplicity.
     box_list = list(boxes)
@@ -112,9 +120,21 @@ def fix_box_overlaps_with_vision(
         if x2 - x1 < min_width_px:
             continue
 
-        mid_y = (y1 + y2) // 2
-        y_top = _clamp_int(mid_y - strip_half_height_px, 0, height - 1)
-        y_bottom = _clamp_int(mid_y + strip_half_height_px, 1, height)
+        # Scan only the middle band of the target box to ignore underlines
+        # (usually near the bottom) and symbols from nearby lines.
+        box_h = y2 - y1
+        band_top = y1 + int(box_h * scan_top_ratio)
+        band_bottom = y1 + int(box_h * scan_bottom_ratio)
+        band_top = _clamp_int(band_top, y1, max(y1, y2 - 1))
+        band_bottom = _clamp_int(band_bottom, min(y2, y1 + 1), y2)
+
+        if band_bottom - band_top < 4:
+            mid_y = (y1 + y2) // 2
+            y_top = _clamp_int(mid_y - strip_half_height_px, 0, height - 1)
+            y_bottom = _clamp_int(mid_y + strip_half_height_px, 1, height)
+        else:
+            y_top = band_top
+            y_bottom = band_bottom
         if y_bottom <= y_top:
             continue
 

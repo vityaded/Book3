@@ -128,6 +128,8 @@ CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
 CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
 CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
 CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
+CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
+CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
@@ -1571,6 +1573,8 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         min_width_px=CV_MIN_WIDTH_PX,
                         strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
+                        scan_top_ratio=CV_SCAN_TOP_RATIO,
+                        scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (pre-filter) failed on page %s: %s", page_index, exc)
@@ -1604,6 +1608,8 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         min_width_px=CV_MIN_WIDTH_PX,
                         strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
+                        scan_top_ratio=CV_SCAN_TOP_RATIO,
+                        scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (post-align) failed on page %s: %s", page_index, exc)
