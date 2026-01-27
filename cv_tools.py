@@ -658,6 +658,60 @@ def fix_box_overlaps_with_vision(
         else:
             _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note="no_underline")
 
+        # Last tweak: expand to underline span without overlapping ink.
+        if underline_span is not None:
+            expand_band = _middle_band(cur_y1, cur_y2)
+            blocked_left = False
+            blocked_right = False
+            if expand_band is not None:
+                exp_y_top, exp_y_bottom = expand_band
+                target_left = max(0, min(int(underline_span[0]), int(cur_x1)))
+                target_right = min(width, max(int(underline_span[1]), int(cur_x2)))
+
+                exp_start = max(0, min(target_left, cur_x1))
+                exp_end = min(width, max(target_right, cur_x2))
+
+                if exp_end - exp_start >= 4 and exp_y_bottom > exp_y_top:
+                    exp_strip = img[exp_y_top:exp_y_bottom, exp_start:exp_end]
+                    if exp_strip.size > 0:
+                        _, exp_binary = cv2.threshold(exp_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+
+                        # Left expansion
+                        if target_left < cur_x1:
+                            rel_start = int(target_left - exp_start)
+                            rel_end = int(cur_x1 - exp_start)
+                            if rel_end - rel_start > 1:
+                                region = exp_binary[:, rel_start:rel_end]
+                                coords = cv2.findNonZero(region)
+                                if coords is None:
+                                    cur_x1 = target_left
+                                else:
+                                    blocked_left = True
+
+                        # Right expansion
+                        if target_right > cur_x2:
+                            rel_start = int(cur_x2 - exp_start)
+                            rel_end = int(target_right - exp_start)
+                            if rel_end - rel_start > 1:
+                                region = exp_binary[:, rel_start:rel_end]
+                                coords = cv2.findNonZero(region)
+                                if coords is None:
+                                    cur_x2 = target_right
+                                else:
+                                    blocked_right = True
+
+            _record(
+                "underline_expand",
+                cur_x1,
+                cur_x2,
+                cur_y1,
+                cur_y2,
+                note=(
+                    f"span={underline_span} blocked_left={blocked_left} "
+                    f"blocked_right={blocked_right}"
+                ),
+            )
+
         cur_x1 = _clamp_int(cur_x1, 0, width - 1)
         cur_x2 = _clamp_int(cur_x2, 1, width)
         if cur_x2 <= cur_x1:
