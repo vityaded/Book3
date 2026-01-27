@@ -132,6 +132,7 @@ CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
 CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
 CV_EDGE_SCAN_PX = _cv_edge_scan_raw if _cv_edge_scan_raw > 0 else None
+CV_DEBUG = os.getenv("CV_DEBUG", "0") == "1"
 CV_UNDERLINE_ENABLED = os.getenv("CV_UNDERLINE_ENABLED", "1") == "1"
 CV_UNDERLINE_BAND_TOP_RATIO = float(os.getenv("CV_UNDERLINE_BAND_TOP_RATIO", "0.62"))
 CV_UNDERLINE_EXTRA_BOTTOM_PX = int(os.getenv("CV_UNDERLINE_EXTRA_BOTTOM_PX", "10"))
@@ -139,6 +140,11 @@ _cv_underline_margin_raw = int(os.getenv("CV_UNDERLINE_MARGIN_X_PX", "0"))
 CV_UNDERLINE_MARGIN_X_PX = _cv_underline_margin_raw if _cv_underline_margin_raw > 0 else None
 CV_UNDERLINE_ROW_RATIO_MIN = float(os.getenv("CV_UNDERLINE_ROW_RATIO_MIN", "0.02"))
 CV_UNDERLINE_MIN_ROW_PIXELS = int(os.getenv("CV_UNDERLINE_MIN_ROW_PIXELS", "12"))
+CV_UNDERLINE_LINE_COVERAGE_MIN = float(os.getenv("CV_UNDERLINE_LINE_COVERAGE_MIN", "0.16"))
+CV_UNDERLINE_SEGMENTS_MIN = int(os.getenv("CV_UNDERLINE_SEGMENTS_MIN", "3"))
+CV_UNDERLINE_GAP_CV_MAX = float(os.getenv("CV_UNDERLINE_GAP_CV_MAX", "1.4"))
+CV_UNDERLINE_BELOW_SCAN_PX = int(os.getenv("CV_UNDERLINE_BELOW_SCAN_PX", "28"))
+CV_UNDERLINE_BELOW_MARGIN_TOP_PX = int(os.getenv("CV_UNDERLINE_BELOW_MARGIN_TOP_PX", "2"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
@@ -1556,7 +1562,13 @@ def filter_filled_boxes(image: Image.Image, boxes: list[dict]) -> list[dict]:
     return filtered
 
 
-def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path | None = None) -> dict:
+def process_page(
+    job_id: str,
+    page_index: int,
+    image_path: Path,
+    pdf_path: Path | None = None,
+    cv_debug: bool = False,
+) -> dict:
     error = ""
     boxes = []
     ocr_debug = []
@@ -1591,6 +1603,13 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
                         underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
                         underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
+                        underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
+                        underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
+                        underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
+                        underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
+                        underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                        debug=cv_debug,
+                        debug_pass_name="pre_filter",
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (pre-filter) failed on page %s: %s", page_index, exc)
@@ -1633,6 +1652,13 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
                         underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
                         underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
+                        underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
+                        underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
+                        underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
+                        underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
+                        underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                        debug=cv_debug,
+                        debug_pass_name="post_align",
                     )
                 except Exception as exc:
                     logger.warning("Vision correction (post-align) failed on page %s: %s", page_index, exc)
@@ -1654,6 +1680,20 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
             logger.exception("Gemini failed on page %s", page_index)
             error = str(exc)
 
+    cv_debug_step_count = 0
+    cv_debug_step_labels: list[str] = []
+    if cv_debug:
+        debug_steps_lists = [box.get("cv_debug_steps") for box in boxes if box.get("cv_debug_steps")]
+        if debug_steps_lists:
+            cv_debug_step_count = max(len(steps) for steps in debug_steps_lists)
+            reference_steps = max(debug_steps_lists, key=len)
+            for idx in range(cv_debug_step_count):
+                if idx < len(reference_steps):
+                    label = str(reference_steps[idx].get("step", f"step_{idx + 1}"))
+                else:
+                    label = f"step_{idx + 1}"
+                cv_debug_step_labels.append(label)
+
     return {
         "page": page_index,
         "image": f"jobs/{job_id}/{image_path.name}",
@@ -1662,11 +1702,19 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
         "boxes": boxes,
         "ocr_words": ocr_debug,
         "ocr_words_total": ocr_debug_total,
+        "cv_debug": cv_debug,
+        "cv_debug_step_count": cv_debug_step_count,
+        "cv_debug_step_labels": cv_debug_step_labels,
         "error": error,
     }
 
 
-def process_images(job_id: str, image_paths: list[Path], pdf_path: Path | None = None) -> dict:
+def process_images(
+    job_id: str,
+    image_paths: list[Path],
+    pdf_path: Path | None = None,
+    cv_debug: bool = False,
+) -> dict:
     pages = []
 
     if MAX_CONCURRENT_PAGES > 1 and len(image_paths) > 1:
@@ -1674,18 +1722,28 @@ def process_images(job_id: str, image_paths: list[Path], pdf_path: Path | None =
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = []
             for page_index, image_path in enumerate(image_paths, start=1):
-                futures.append(executor.submit(process_page, job_id, page_index, image_path, pdf_path))
+                futures.append(
+                    executor.submit(
+                        process_page,
+                        job_id,
+                        page_index,
+                        image_path,
+                        pdf_path,
+                        cv_debug=cv_debug,
+                    )
+                )
             for future in as_completed(futures):
                 pages.append(future.result())
         pages.sort(key=lambda page: page["page"])
     else:
         for page_index, image_path in enumerate(image_paths, start=1):
-            pages.append(process_page(job_id, page_index, image_path, pdf_path))
+            pages.append(process_page(job_id, page_index, image_path, pdf_path, cv_debug=cv_debug))
 
     return {
         "job_id": job_id,
         "model": GEMINI_MODEL,
         "debug_ocr": DEBUG_OCR_LAYER and not NO_OCR,
+        "debug_cv": cv_debug,
         "pages": pages,
     }
 
@@ -1700,6 +1758,14 @@ def load_result(job_id: str) -> dict:
     if not result_path.exists():
         raise FileNotFoundError
     return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def resolve_cv_debug_request() -> bool:
+    """Resolve CV debug mode from request args/form, falling back to env."""
+    requested = request.args.get("cv_debug") or request.form.get("cv_debug")
+    if requested is None or str(requested).strip() == "":
+        return CV_DEBUG
+    return is_truthy(requested)
 
 
 @app.route("/")
@@ -1724,6 +1790,7 @@ def upload():
 
     job_id = uuid.uuid4().hex[:10]
     job_dir, job_static = create_job_dirs(job_id)
+    cv_debug = resolve_cv_debug_request()
 
     ext = Path(file.filename).suffix.lower()
     upload_path = job_dir / f"upload{ext}"
@@ -1742,7 +1809,7 @@ def upload():
         flash(f"Failed to process file: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths, pdf_path=pdf_for_anchors)
+    result = process_images(job_id, image_paths, pdf_path=pdf_for_anchors, cv_debug=cv_debug)
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 
@@ -1764,6 +1831,7 @@ def paste():
 
     job_id = uuid.uuid4().hex[:10]
     job_dir, job_static = create_job_dirs(job_id)
+    cv_debug = resolve_cv_debug_request()
 
     upload_path = job_dir / "clipboard.png"
     file.save(upload_path)
@@ -1774,7 +1842,7 @@ def paste():
         flash(f"Failed to read clipboard image: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths)
+    result = process_images(job_id, image_paths, cv_debug=cv_debug)
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 
@@ -1785,7 +1853,12 @@ def result(job_id: str):
         job = load_result(job_id)
     except FileNotFoundError:
         abort(404)
-    return render_template("result.html", job=job, debug_ocr=DEBUG_OCR_LAYER and not NO_OCR)
+    return render_template(
+        "result.html",
+        job=job,
+        debug_ocr=DEBUG_OCR_LAYER and not NO_OCR,
+        debug_cv=bool(job.get("debug_cv")),
+    )
 
 
 @app.route("/api/job/<job_id>")

@@ -16,6 +16,12 @@
             Upload a PDF or image (or paste from your clipboard). Gemini finds the answer areas and
             we overlay text boxes right on the page.
           </p>
+          <div class="cv-debug-toggle">
+            <label for="cv-debug-toggle">
+              <input id="cv-debug-toggle" type="checkbox" />
+              CV debug mode (step-by-step alignment)
+            </label>
+          </div>
         </div>
         <div class="card">
           <h2>Quick tips</h2>
@@ -36,6 +42,7 @@
           <h2>Upload PDF or image</h2>
           <p>Select a file and let Gemini handle the bounding boxes.</p>
           <form id="upload-form" action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+            <input id="cv-debug-hidden" type="hidden" name="cv_debug" value="0" />
             <input class="file-input" type="file" name="file" accept="application/pdf,image/*" required />
             <button class="button" type="submit">Process file</button>
           </form>

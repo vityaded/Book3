@@ -65,6 +65,152 @@ def _update_box_y_from_pixels(box: dict, y1: int, y2: int, height: int) -> None:
     box["h"] = (y2 - y1) / height
 
 
+def _segments_from_row(row_mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return contiguous ink segments as (start, end) inclusive indices."""
+    segments: list[tuple[int, int]] = []
+    in_segment = False
+    seg_start = 0
+    for idx, value in enumerate(row_mask):
+        if value and not in_segment:
+            in_segment = True
+            seg_start = idx
+        elif not value and in_segment:
+            segments.append((seg_start, idx - 1))
+            in_segment = False
+    if in_segment:
+        segments.append((seg_start, len(row_mask) - 1))
+    return segments
+
+
+def _analyze_row_pattern(
+    row_mask: np.ndarray,
+    *,
+    coverage_min: float,
+    segments_min: int,
+    gap_cv_max: float,
+) -> dict | None:
+    """Analyze a single row for underline-like patterns."""
+    if row_mask.size == 0:
+        return None
+    ink_idx = np.flatnonzero(row_mask)
+    if ink_idx.size == 0:
+        return None
+
+    width = int(row_mask.size)
+    coverage_ratio = float(ink_idx.size / max(width, 1))
+    segments = _segments_from_row(row_mask.astype(bool))
+    segments_count = len(segments)
+    span_start = int(ink_idx.min())
+    span_end = int(ink_idx.max())
+    center_x = int(np.median(ink_idx))
+
+    gaps: list[int] = []
+    for i in range(len(segments) - 1):
+        gaps.append(max(0, segments[i + 1][0] - segments[i][1] - 1))
+
+    gap_cv = float("inf")
+    if gaps:
+        mean_gap = float(np.mean(gaps))
+        if mean_gap > 0:
+            gap_cv = float(np.std(gaps) / mean_gap)
+        else:
+            gap_cv = 0.0
+
+    dotted_like = segments_count >= segments_min and (gap_cv <= gap_cv_max or coverage_ratio >= coverage_min * 0.7)
+    solid_like = coverage_ratio >= coverage_min
+    real_line = bool(solid_like or dotted_like)
+
+    # Score: prefer broader coverage and consistent dotted patterns.
+    segment_term = min(segments_count, 8) / 8.0
+    if gaps and np.isfinite(gap_cv):
+        gap_term = max(0.0, 1.0 - min(gap_cv / max(gap_cv_max, 1e-6), 1.5))
+    else:
+        gap_term = 0.0
+    score = coverage_ratio * 1.6 + segment_term * 0.25 + gap_term * 0.25
+    if real_line:
+        score += 0.35
+
+    return {
+        "coverage_ratio": coverage_ratio,
+        "segments_count": segments_count,
+        "gap_cv": gap_cv,
+        "span_start": span_start,
+        "span_end": span_end,
+        "center_x": center_x,
+        "real_line": real_line,
+        "score": float(score),
+    }
+
+
+def _detect_underline_in_region(
+    img: np.ndarray,
+    *,
+    x1: int,
+    x2: int,
+    y1: int,
+    y2: int,
+    threshold: int,
+    coverage_min: float,
+    segments_min: int,
+    gap_cv_max: float,
+) -> dict | None:
+    """Detect the best underline-like row within a region."""
+    if x2 - x1 < 6 or y2 - y1 < 4:
+        return None
+
+    strip = img[y1:y2, x1:x2]
+    if strip.size == 0:
+        return None
+    _, binary = cv2.threshold(strip, threshold, 255, cv2.THRESH_BINARY_INV)
+
+    best_line: dict | None = None
+    best_fragment: dict | None = None
+
+    for row_idx in range(binary.shape[0]):
+        row = binary[row_idx, :] > 0
+        analysis = _analyze_row_pattern(
+            row,
+            coverage_min=coverage_min,
+            segments_min=segments_min,
+            gap_cv_max=gap_cv_max,
+        )
+        if analysis is None:
+            continue
+        analysis["row_idx"] = int(row_idx)
+        if analysis["real_line"]:
+            if best_line is None or analysis["score"] > best_line["score"]:
+                best_line = analysis
+        else:
+            if best_fragment is None or analysis["score"] > best_fragment["score"]:
+                best_fragment = analysis
+
+    if best_line is not None:
+        row_idx = best_line["row_idx"]
+        underline_y = y1 + row_idx
+        span = (x1 + int(best_line["span_start"]), x1 + int(best_line["span_end"]))
+        return {
+            "real_line": True,
+            "underline_y": int(underline_y),
+            "span": span,
+            "analysis": best_line,
+        }
+
+    if best_fragment is not None:
+        row_idx = best_fragment["row_idx"]
+        fragment_y = y1 + row_idx
+        span = (x1 + int(best_fragment["span_start"]), x1 + int(best_fragment["span_end"]))
+        center_x = x1 + int(best_fragment["center_x"])
+        return {
+            "real_line": False,
+            "underline_y": int(fragment_y),
+            "span": span,
+            "center_x": int(center_x),
+            "analysis": best_fragment,
+        }
+
+    return None
+
+
 def _default_search_width_px(width: int) -> int:
     # ~5% of the page width, bounded to keep scanning fast and consistent.
     return _clamp_int(int(width * 0.05), 40, 140)
@@ -88,6 +234,13 @@ def fix_box_overlaps_with_vision(
     underline_margin_x_px: int | None = None,
     underline_row_ratio_min: float = 0.02,
     underline_min_row_pixels: int = 12,
+    underline_line_coverage_min: float = 0.16,
+    underline_segments_min: int = 3,
+    underline_gap_cv_max: float = 1.4,
+    underline_below_scan_px: int = 28,
+    underline_below_margin_top_px: int = 2,
+    debug: bool = False,
+    debug_pass_name: str | None = None,
 ) -> list[dict]:
     """
     Use pixel scanning to push answer boxes away from ink under their edges.
@@ -126,6 +279,11 @@ def fix_box_overlaps_with_vision(
     underline_extra_bottom_px = max(0, int(underline_extra_bottom_px))
     underline_row_ratio_min = max(0.0, float(underline_row_ratio_min))
     underline_min_row_pixels = max(1, int(underline_min_row_pixels))
+    underline_line_coverage_min = max(0.02, float(underline_line_coverage_min))
+    underline_segments_min = max(2, int(underline_segments_min))
+    underline_gap_cv_max = max(0.2, float(underline_gap_cv_max))
+    underline_below_scan_px = max(0, int(underline_below_scan_px))
+    underline_below_margin_top_px = max(0, int(underline_below_margin_top_px))
 
     # Work on a concrete list and mutate in place for simplicity.
     box_list = list(boxes)
@@ -143,9 +301,57 @@ def fix_box_overlaps_with_vision(
             continue
         x1, y1, x2, y2 = bounds
         orig_box_h = y2 - y1
+        orig_box_w = x2 - x1
 
         if x2 - x1 < min_width_px:
             continue
+
+        steps_out = box.setdefault("cv_debug_steps", []) if debug else None
+        pass_name = (debug_pass_name or "").strip()
+
+        def _step_label(stage: str) -> str:
+            return f"{pass_name}.{stage}" if pass_name else stage
+
+        def _norm(x1_n: int, x2_n: int, y1_n: int, y2_n: int) -> tuple[float, float, float, float]:
+            return (
+                x1_n / width,
+                y1_n / height,
+                (x2_n - x1_n) / width,
+                (y2_n - y1_n) / height,
+            )
+
+        def _record(stage: str, x1_r: int, x2_r: int, y1_r: int, y2_r: int, note: str | None = None) -> None:
+            if not debug or steps_out is None:
+                return
+            x_n, y_n, w_n, h_n = _norm(x1_r, x2_r, y1_r, y2_r)
+            entry = {
+                "step": _step_label(stage),
+                "stage": stage,
+                "pass": pass_name,
+                "x": x_n,
+                "y": y_n,
+                "w": w_n,
+                "h": h_n,
+                "x1_px": int(x1_r),
+                "x2_px": int(x2_r),
+                "y1_px": int(y1_r),
+                "y2_px": int(y2_r),
+            }
+            if note:
+                entry["note"] = note
+            steps_out.append(entry)
+            logger.info(
+                "CV_DEBUG page_box=%s step=%s x=%.4f y=%.4f w=%.4f h=%.4f note=%s",
+                box.get("id", "?"),
+                entry["step"],
+                entry["x"],
+                entry["y"],
+                entry["w"],
+                entry["h"],
+                entry.get("note", ""),
+            )
+
+        _record("initial", x1, x2, y1, y2, note=f"w_px={orig_box_w} h_px={orig_box_h}")
 
         def _middle_band(y1_b: int, y2_b: int) -> tuple[int, int] | None:
             box_h_b = y2_b - y1_b
@@ -222,9 +428,9 @@ def fix_box_overlaps_with_vision(
         # How much of each edge to inspect for ink under the box itself.
         local_edge_scan_px = edge_scan_px
         if local_edge_scan_px is None or local_edge_scan_px <= 0:
-            local_edge_scan_px = _clamp_int(int((x2 - x1) * 0.35), 20, min(120, x2 - x1))
+            local_edge_scan_px = _clamp_int(int((x2 - x1) * 0.05), 5, min(120, x2 - x1))
         local_edge_scan_px = min(local_edge_scan_px, x2 - x1)
-        if local_edge_scan_px < 6:
+        if local_edge_scan_px < 5:
             continue
 
         # 1) If ink exists under the left edge of the box, push right.
@@ -295,8 +501,15 @@ def fix_box_overlaps_with_vision(
         cur_x1, cur_x2 = new_x1, new_x2
         cur_y1, cur_y2 = y1, y2
 
+        edge_note = (
+            f"left_edge_ink={left_edge_ink} right_edge_ink={right_edge_ink} "
+            f"cand_x1={cur_x1} cand_x2={cur_x2}"
+        )
+        _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note=edge_note)
+
         underline_span: tuple[int, int] | None = None
         underline_y: int | None = None
+        underline_source: str | None = None
 
         if underline_enabled:
             # 3) Detect underline/dotted line near the bottom and align to it.
@@ -305,45 +518,117 @@ def fix_box_overlaps_with_vision(
                 margin_x = max(12, min(search_width_px, 220))
             margin_x = max(0, int(margin_x))
 
-            underline_x1 = max(0, cur_x1 - margin_x)
-            underline_x2 = min(width, cur_x2 + margin_x)
-            underline_y1 = cur_y1 + int(orig_box_h * underline_band_top_ratio)
-            underline_y2 = min(height, cur_y2 + underline_extra_bottom_px)
-            underline_y1 = _clamp_int(underline_y1, cur_y1, max(cur_y1, underline_y2 - 1))
-            underline_y2 = _clamp_int(underline_y2, min(height, underline_y1 + 1), height)
+            def _min_row_pixels(x1_r: int, x2_r: int) -> int:
+                return max(underline_min_row_pixels, int((x2_r - x1_r) * underline_row_ratio_min))
 
-            if underline_y2 - underline_y1 >= 4 and underline_x2 - underline_x1 >= 6:
-                underline_strip = img[underline_y1:underline_y2, underline_x1:underline_x2]
-                _, underline_binary = cv2.threshold(
-                    underline_strip, threshold, 255, cv2.THRESH_BINARY_INV
+            # Near-bottom scan first.
+            near_x1 = max(0, cur_x1 - margin_x)
+            near_x2 = min(width, cur_x2 + margin_x)
+            near_y1 = cur_y1 + int(orig_box_h * underline_band_top_ratio)
+            near_y2 = min(height, cur_y2 + underline_extra_bottom_px)
+            near_y1 = _clamp_int(near_y1, cur_y1, max(cur_y1, near_y2 - 1))
+            near_y2 = _clamp_int(near_y2, min(height, near_y1 + 1), height)
+
+            near_result = _detect_underline_in_region(
+                img,
+                x1=near_x1,
+                x2=near_x2,
+                y1=near_y1,
+                y2=near_y2,
+                threshold=threshold,
+                coverage_min=underline_line_coverage_min,
+                segments_min=underline_segments_min,
+                gap_cv_max=underline_gap_cv_max,
+            )
+
+            if near_result and near_result.get("real_line"):
+                # Enforce a minimum density to avoid letter fragments.
+                analysis = near_result.get("analysis") or {}
+                row_pixels_ok = analysis.get("coverage_ratio", 0.0) >= (
+                    _min_row_pixels(near_x1, near_x2) / max(near_x2 - near_x1, 1)
                 )
-                row_counts = np.count_nonzero(underline_binary, axis=1)
-                if row_counts.size:
-                    peak_idx = int(np.argmax(row_counts))
-                    peak_val = int(row_counts[peak_idx])
-                    min_row_pixels = max(
-                        underline_min_row_pixels,
-                        int((underline_x2 - underline_x1) * underline_row_ratio_min),
+                if row_pixels_ok:
+                    underline_y = int(near_result["underline_y"])
+                    underline_span = near_result.get("span")
+                    underline_source = "near"
+
+            # If near-bottom found only a fragment, move away from it.
+            if underline_y is None and near_result and not near_result.get("real_line"):
+                frag_span = near_result.get("span")
+                frag_center = near_result.get("center_x")
+                if frag_span and frag_center is not None:
+                    frag_left, frag_right = int(frag_span[0]), int(frag_span[1])
+                    box_mid = cur_x1 + max(1, (cur_x2 - cur_x1)) // 2
+                    if frag_center <= box_mid:
+                        # Fragment is on the left half; push right past it.
+                        cur_x1 = max(cur_x1, frag_right + padding_px)
+                        cur_x1 = min(cur_x1, cur_x2 - min_width_px)
+                        _record(
+                            "underline_fragment_adjust",
+                            cur_x1,
+                            cur_x2,
+                            cur_y1,
+                            cur_y2,
+                            note=f"fragment_left span={frag_span} center={frag_center}",
+                        )
+                    else:
+                        # Fragment is on the right half; pull left before it.
+                        cur_x2 = min(cur_x2, frag_left - padding_px)
+                        cur_x2 = max(cur_x2, cur_x1 + min_width_px)
+                        _record(
+                            "underline_fragment_adjust",
+                            cur_x1,
+                            cur_x2,
+                            cur_y1,
+                            cur_y2,
+                            note=f"fragment_right span={frag_span} center={frag_center}",
+                        )
+
+            # If no underline yet, scan below the box for a real line.
+            if underline_y is None and underline_below_scan_px > 0:
+                below_x1 = max(0, cur_x1 - margin_x)
+                below_x2 = min(width, cur_x2 + margin_x)
+                below_y1 = min(height - 1, cur_y2 + underline_below_margin_top_px)
+                below_y2 = min(height, below_y1 + underline_below_scan_px)
+                below_y1 = _clamp_int(below_y1, 0, max(0, below_y2 - 1))
+                below_y2 = _clamp_int(below_y2, min(height, below_y1 + 1), height)
+
+                below_result = _detect_underline_in_region(
+                    img,
+                    x1=below_x1,
+                    x2=below_x2,
+                    y1=below_y1,
+                    y2=below_y2,
+                    threshold=threshold,
+                    coverage_min=underline_line_coverage_min,
+                    segments_min=underline_segments_min,
+                    gap_cv_max=underline_gap_cv_max,
+                )
+                if below_result and below_result.get("real_line"):
+                    analysis = below_result.get("analysis") or {}
+                    row_pixels_ok = analysis.get("coverage_ratio", 0.0) >= (
+                        _min_row_pixels(below_x1, below_x2) / max(below_x2 - below_x1, 1)
                     )
-                    if peak_val >= min_row_pixels:
-                        # Use a small band around the peak row to estimate the underline span.
-                        row_lo = max(0, peak_idx - 1)
-                        row_hi = min(row_counts.size, peak_idx + 2)
-                        underline_rows = underline_binary[row_lo:row_hi, :]
-                        coords = cv2.findNonZero(underline_rows)
-                        if coords is not None:
-                            local_xs = coords[:, 0, 0]
-                            span_x1 = underline_x1 + int(np.min(local_xs))
-                            span_x2 = underline_x1 + int(np.max(local_xs))
-                            if span_x2 > span_x1:
-                                underline_span = (span_x1, span_x2)
-                                underline_y = underline_y1 + peak_idx
+                    if row_pixels_ok:
+                        underline_y = int(below_result["underline_y"])
+                        underline_span = below_result.get("span")
+                        underline_source = "below"
 
         if underline_y is not None:
             # Lift the box so its bottom sits on the underline.
             new_y2 = _clamp_int(underline_y, 1, height)
             new_y1 = max(0, new_y2 - orig_box_h)
             cur_y1, cur_y2 = new_y1, new_y2
+            _record(
+                "underline_align",
+                cur_x1,
+                cur_x2,
+                cur_y1,
+                cur_y2,
+                note=f"underline_y={underline_y} span={underline_span} source={underline_source}",
+            )
+        else:
+            _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note="no_underline")
 
         # 4) Snap the left edge to the nearest letters on the left using the
         # current vertical placement (after underline alignment).
@@ -367,6 +652,7 @@ def fix_box_overlaps_with_vision(
                         snap_x1 = _clamp_int(snap_x1, 0, width - 1)
                         if cur_x2 - snap_x1 >= 4:
                             cur_x1 = snap_x1
+        _record("snap_left", cur_x1, cur_x2, cur_y1, cur_y2)
 
         # 5) Extend to the underline length when we have a span.
         if underline_span is not None:
@@ -377,6 +663,16 @@ def fix_box_overlaps_with_vision(
             # If the underline starts to the right, allow moving right slightly.
             if span_x1 > cur_x1:
                 cur_x1 = min(span_x1, cur_x2 - min_width_px)
+            _record(
+                "underline_extend",
+                cur_x1,
+                cur_x2,
+                cur_y1,
+                cur_y2,
+                note=f"span={underline_span}",
+            )
+        else:
+            _record("underline_extend", cur_x1, cur_x2, cur_y1, cur_y2, note="no_span")
 
         cur_x1 = _clamp_int(cur_x1, 0, width - 1)
         cur_x2 = _clamp_int(cur_x2, 1, width)
@@ -386,10 +682,12 @@ def fix_box_overlaps_with_vision(
             continue
 
         if cur_x1 == x1 and cur_x2 == x2 and cur_y1 == y1 and cur_y2 == y2:
+            _record("final", cur_x1, cur_x2, cur_y1, cur_y2, note="unchanged")
             continue
 
         _update_box_from_pixels(box, cur_x1, cur_x2, width)
         _update_box_y_from_pixels(box, cur_y1, cur_y2, height)
+        _record("final", cur_x1, cur_x2, cur_y1, cur_y2)
         modified += 1
 
     if modified:

@@ -5,6 +5,8 @@
   const clipboardStatus = document.getElementById("clipboard-status");
   const processing = document.getElementById("processing");
   const uploadForm = document.getElementById("upload-form");
+  const cvDebugToggle = document.getElementById("cv-debug-toggle");
+  const cvDebugHidden = document.getElementById("cv-debug-hidden");
 
   let clipboardFile = null;
 
@@ -20,8 +22,22 @@
     }
   };
 
+  const isCvDebugEnabled = () => Boolean(cvDebugToggle && cvDebugToggle.checked);
+
+  const syncCvDebugHidden = () => {
+    if (cvDebugHidden) {
+      cvDebugHidden.value = isCvDebugEnabled() ? "1" : "0";
+    }
+  };
+
+  if (cvDebugToggle) {
+    cvDebugToggle.addEventListener("change", syncCvDebugHidden);
+    syncCvDebugHidden();
+  }
+
   if (uploadForm) {
     uploadForm.addEventListener("submit", () => {
+      syncCvDebugHidden();
       showProcessing();
     });
   }
@@ -73,6 +89,7 @@
 
       const formData = new FormData();
       formData.append("image", clipboardFile, clipboardFile.name || "clipboard.png");
+      formData.append("cv_debug", isCvDebugEnabled() ? "1" : "0");
 
       pasteButton.disabled = true;
       setStatus("Uploading clipboard image...");

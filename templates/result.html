@@ -11,6 +11,9 @@
       <section class="hero">
         <div>
           <span class="badge">Job {{ job.job_id }}</span>
+          {% if debug_cv %}
+            <span class="badge debug">CV debug</span>
+          {% endif %}
           <h1>Overlay preview</h1>
           <p>Type directly on top of the page images. Boxes come from {{ job.model }}.</p>
           <div class="link-row">
@@ -22,7 +25,16 @@
 
       {% for page in job.pages %}
         {% set show_ocr = debug_ocr and page.ocr_words %}
-        <section class="page-card">
+        {% set cv_debug_enabled = debug_cv and (page.cv_debug_step_count or 0) > 0 %}
+        <section
+          class="page-card"
+          data-page="{{ page.page }}"
+          {% if cv_debug_enabled %}
+            data-cv-debug="1"
+            data-cv-step-count="{{ page.cv_debug_step_count }}"
+            data-cv-step-labels='{{ page.cv_debug_step_labels | tojson }}'
+          {% endif %}
+        >
           {% if show_ocr %}
             <input class="ocr-toggle" id="ocr-{{ job.job_id }}-{{ page.page }}" type="checkbox" checked />
           {% endif %}
@@ -41,6 +53,12 @@
               {% endif %}
             </div>
           </div>
+          {% if cv_debug_enabled %}
+            <div class="cv-debug-controls" data-cv-controls>
+              <button class="button secondary cv-debug-next" type="button" data-cv-next>Next step</button>
+              <span class="cv-debug-step" data-cv-step-label></span>
+            </div>
+          {% endif %}
           <div class="page-wrap">
             <img class="page-image" src="{{ url_for('static', filename=page.image) }}" alt="Page {{ page.page }}" />
             <div class="overlay">
@@ -65,10 +83,16 @@
                 {% set width = (box.w * 100) | round(4) %}
                 {% set height = (box.h * 100) | round(4) %}
                 {% set anchor = (box.anchor or '') | trim %}
+                {% set cv_steps = box.cv_debug_steps if cv_debug_enabled else none %}
                 {% if box.type == 'answer' %}
                   <div
                     class="answer-wrap"
                     style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
+                    data-box-id="{{ box.id }}"
+                    {% if cv_steps %}
+                      data-cv-debug="1"
+                      data-cv-debug-steps='{{ cv_steps | tojson }}'
+                    {% endif %}
                     {% if anchor and anchor|lower != 'none' %}data-anchor="{{ anchor }}"{% endif %}
                   >
                     {% if box.h > 0.06 %}
@@ -81,6 +105,11 @@
                   <div
                     class="exercise-box"
                     style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
+                    data-box-id="{{ box.id }}"
+                    {% if cv_steps %}
+                      data-cv-debug="1"
+                      data-cv-debug-steps='{{ cv_steps | tojson }}'
+                    {% endif %}
                   ></div>
                 {% endif %}
               {% endfor %}
@@ -89,5 +118,94 @@
         </section>
       {% endfor %}
     </main>
+    {% if debug_cv %}
+      <script>
+        document.addEventListener("DOMContentLoaded", () => {
+          const pageCards = document.querySelectorAll(".page-card[data-cv-debug=\"1\"]");
+          if (!pageCards.length) {
+            console.info("[CV_DEBUG] Debug mode is on but no debug steps were found.");
+            return;
+          }
+
+          const parseJsonAttr = (el, name, fallback) => {
+            const raw = el.getAttribute(name);
+            if (!raw) return fallback;
+            try {
+              return JSON.parse(raw);
+            } catch (err) {
+              console.warn("[CV_DEBUG] Failed to parse", name, err);
+              return fallback;
+            }
+          };
+
+          const applyStepToPage = (pageEl, stepIndex) => {
+            const pageNum = pageEl.getAttribute("data-page") || "?";
+            const labels = parseJsonAttr(pageEl, "data-cv-step-labels", []);
+            const debugBoxes = pageEl.querySelectorAll("[data-cv-debug=\"1\"][data-cv-debug-steps]");
+            if (!debugBoxes.length) return;
+
+            let stepCount = Number(pageEl.getAttribute("data-cv-step-count") || 0);
+            if (!stepCount) {
+              stepCount = 0;
+              debugBoxes.forEach((boxEl) => {
+                const steps = parseJsonAttr(boxEl, "data-cv-debug-steps", []);
+                stepCount = Math.max(stepCount, steps.length);
+              });
+            }
+            if (stepCount <= 0) return;
+
+            const clampedIndex = Math.min(Math.max(stepIndex, 0), stepCount - 1);
+            pageEl.setAttribute("data-cv-step-index", String(clampedIndex));
+
+            const label = labels[clampedIndex] || `step_${clampedIndex + 1}`;
+            const labelEl = pageEl.querySelector("[data-cv-step-label]");
+            if (labelEl) {
+              labelEl.textContent = `Step ${clampedIndex + 1}/${stepCount}: ${label}`;
+            }
+
+            console.groupCollapsed(`[CV_DEBUG] Page ${pageNum} step ${clampedIndex + 1}/${stepCount}: ${label}`);
+            debugBoxes.forEach((boxEl) => {
+              if (!boxEl._cvSteps) {
+                boxEl._cvSteps = parseJsonAttr(boxEl, "data-cv-debug-steps", []);
+              }
+              const steps = boxEl._cvSteps;
+              if (!steps.length) return;
+              const step = steps[Math.min(clampedIndex, steps.length - 1)];
+              if (!step) return;
+
+              const left = (Number(step.x) * 100).toFixed(4) + "%";
+              const top = (Number(step.y) * 100).toFixed(4) + "%";
+              const width = (Number(step.w) * 100).toFixed(4) + "%";
+              const height = (Number(step.h) * 100).toFixed(4) + "%";
+
+              boxEl.style.left = left;
+              boxEl.style.top = top;
+              boxEl.style.width = width;
+              boxEl.style.height = height;
+              boxEl.classList.add("cv-debug-active");
+
+              const boxId = boxEl.getAttribute("data-box-id") || "?";
+              console.log(
+                `[CV_DEBUG] box=${boxId} step=${step.step}`,
+                { note: step.note || "", x: step.x, y: step.y, w: step.w, h: step.h }
+              );
+            });
+            console.groupEnd();
+          };
+
+          pageCards.forEach((pageEl) => {
+            pageEl.setAttribute("data-cv-step-index", "0");
+            applyStepToPage(pageEl, 0);
+
+            const nextBtn = pageEl.querySelector("[data-cv-next]");
+            if (!nextBtn) return;
+            nextBtn.addEventListener("click", () => {
+              const current = Number(pageEl.getAttribute("data-cv-step-index") || 0);
+              applyStepToPage(pageEl, current + 1);
+            });
+          });
+        });
+      </script>
+    {% endif %}
   </body>
 </html>
