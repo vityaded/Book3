@@ -128,8 +128,8 @@ CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
 CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
 CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
 CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
-CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
-CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
+CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.25"))
+CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.75"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
 CV_EDGE_SCAN_PX = _cv_edge_scan_raw if _cv_edge_scan_raw > 0 else None
 CV_DEBUG = os.getenv("CV_DEBUG", "0") == "1"
@@ -148,7 +148,7 @@ CV_UNDERLINE_BELOW_MARGIN_TOP_PX = int(os.getenv("CV_UNDERLINE_BELOW_MARGIN_TOP_
 CV_UNDERLINE_BELOW_RATIO = float(os.getenv("CV_UNDERLINE_BELOW_RATIO", "0.5"))
 CV_UNDERLINE_USE_OTSU = os.getenv("CV_UNDERLINE_USE_OTSU", "1") == "1"
 CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
-CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
+CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "100"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
