@@ -70,6 +70,7 @@ Open http://127.0.0.1:5000
 - `OCR_MIN_WORD_HEIGHT_PX` drops OCR words whose bounding box height is smaller than this many pixels (helps ignore underlines/dots misread as letters; default `0`).
 - `DEBUG_OCR_LAYER=1` includes an OCR text overlay on the results page (or run `python app.py --debug-ocr`).
 - `DEBUG_OCR_LAYER_ALL=1` shows the full OCR overlay (default shows only OCR lines near answer boxes; or run `python app.py --debug-ocr-all`).
+- `NO_OCR=1` (default; or run `python app.py --no-ocr`) disables all OCR usage so boxes come purely from Gemini (no OCRmyPDF, no anchor snapping, no OCR debug overlay). Set `NO_OCR=0` to re-enable OCR features.
 - `ANCHOR_GAP` offsets boxes to the right of the anchor word.
 - `ANCHOR_MAX_SHIFT_X` and `ANCHOR_MAX_SHIFT_Y` cap how far a box can move when snapping to an anchor.
 - `ANCHOR_FUZZY_RATIO` controls fuzzy matching strictness for anchors (higher = stricter).

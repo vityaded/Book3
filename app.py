@@ -99,6 +99,13 @@ ANCHOR_LINE_DY_MULT = float(os.getenv("ANCHOR_LINE_DY_MULT", "3.0"))
 DEBUG_OCR_LAYER = os.getenv("DEBUG_OCR_LAYER", "0") == "1"
 DEBUG_OCR_LAYER_ALL = os.getenv("DEBUG_OCR_LAYER_ALL", "0") == "1"
 OCR_MIN_WORD_HEIGHT_PX = float(os.getenv("OCR_MIN_WORD_HEIGHT_PX", "0") or 0)
+# Default to NO_OCR on; set NO_OCR=0 to re-enable OCR features.
+NO_OCR = os.getenv("NO_OCR", "1") == "1"
+
+if NO_OCR:
+    OCRMY_PDF_ENABLED = False
+    DEBUG_OCR_LAYER = False
+    DEBUG_OCR_LAYER_ALL = False
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
@@ -143,6 +150,7 @@ Rules:
 - Do NOT return a box if the blank already contains a printed or handwritten answer/example.
 - Do NOT include surrounding prompt text; boxes should only cover the writable area.
 - Boxes may overlap underline strokes or dotted lines; those are part of the writable area.
+- Multi-line answers: when a single question provides multiple stacked answer lines (two or more underlines directly under the same prompt), return ONE "answer" box that covers the entire multi-line region. Do NOT return one box per line in that case.
 - Avoid overlapping printed letters or punctuation; if overlap would occur, shrink or shift the box while keeping it aligned to the blank.
 - When a blank follows a word/letter on the same line, place the box immediately to the right of that word/letter with a small gap; do not slide far to the right.
 - Keep the box horizontally aligned with the letters in that line and aligned to the text baseline; the bottom of the box should match the bottom of letters on that line.
@@ -451,6 +459,8 @@ def select_ocr_words_for_debug(ocr_words: list[dict], boxes: list[dict]) -> list
 
 
 def maybe_ocr_pdf(input_pdf: Path, job_dir: Path) -> Path:
+    if NO_OCR:
+        return input_pdf
     if not OCRMY_PDF_ENABLED:
         return input_pdf
 
@@ -1490,7 +1500,11 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
             raw_response = generate_boxes(llm_image)
             boxes = sanitize_boxes(raw_response.get("boxes", []), page_index, llm_size)
             boxes = filter_filled_boxes(image, boxes)
-            if any(clean_anchor_text(str(box.get("anchor", "")).strip()) for box in boxes if box.get("type") == "answer"):
+            if not NO_OCR and any(
+                clean_anchor_text(str(box.get("anchor", "")).strip())
+                for box in boxes
+                if box.get("type") == "answer"
+            ):
                 ocr_words_for_alignment = []
                 used_pdf_words = False
                 if pdf_path is not None:
@@ -1506,7 +1520,7 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                     else:
                         boxes = align_boxes_to_anchor_words(boxes, ocr_words_for_alignment)
 
-            if DEBUG_OCR_LAYER:
+            if DEBUG_OCR_LAYER and not NO_OCR:
                 ocr_words_debug = []
                 debug_used_pdf = False
                 if pdf_path is not None:
@@ -1554,7 +1568,7 @@ def process_images(job_id: str, image_paths: list[Path], pdf_path: Path | None =
     return {
         "job_id": job_id,
         "model": GEMINI_MODEL,
-        "debug_ocr": DEBUG_OCR_LAYER,
+        "debug_ocr": DEBUG_OCR_LAYER and not NO_OCR,
         "pages": pages,
     }
 
@@ -1601,9 +1615,10 @@ def upload():
     pdf_for_anchors = None
     try:
         if ext == ".pdf":
-            ocr_pdf_path = maybe_ocr_pdf(upload_path, job_dir)
-            pdf_for_anchors = ocr_pdf_path
-            image_paths = render_pdf_to_images(ocr_pdf_path, job_static)
+            pdf_for_render = maybe_ocr_pdf(upload_path, job_dir)
+            if not NO_OCR:
+                pdf_for_anchors = pdf_for_render
+            image_paths = render_pdf_to_images(pdf_for_render, job_static)
         else:
             image_paths = [convert_image_to_png(upload_path, job_static)]
     except Exception as exc:
@@ -1653,7 +1668,7 @@ def result(job_id: str):
         job = load_result(job_id)
     except FileNotFoundError:
         abort(404)
-    return render_template("result.html", job=job, debug_ocr=DEBUG_OCR_LAYER)
+    return render_template("result.html", job=job, debug_ocr=DEBUG_OCR_LAYER and not NO_OCR)
 
 
 @app.route("/api/job/<job_id>")
@@ -1680,6 +1695,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Show the full OCR overlay (not filtered to answer lines).",
     )
+    parser.add_argument(
+        "--no-ocr",
+        action="store_true",
+        help="Disable all OCR usage (OCRmyPDF, anchor snapping, and OCR debug overlay).",
+    )
     args, _unknown = parser.parse_known_args()
 
     if args.debug_ocr:
@@ -1687,6 +1707,11 @@ if __name__ == "__main__":
     if args.debug_ocr_all:
         DEBUG_OCR_LAYER = True
         DEBUG_OCR_LAYER_ALL = True
+    if args.no_ocr:
+        NO_OCR = True
+        OCRMY_PDF_ENABLED = False
+        DEBUG_OCR_LAYER = False
+        DEBUG_OCR_LAYER_ALL = False
 
     host = os.getenv("FLASK_HOST", "0.0.0.0")
     port = int(os.getenv("FLASK_PORT", "5000"))
