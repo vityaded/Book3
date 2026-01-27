@@ -31,6 +31,11 @@ except Exception as exc:  # pragma: no cover - import error path
     genai = None
     types = None
 
+try:
+    import cv_tools
+except Exception:
+    cv_tools = None
+
 STATIC_DIR = BASE_DIR / "static"
 JOBS_DIR = BASE_DIR / "data" / "jobs"
 JOB_STATIC_DIR = STATIC_DIR / "jobs"
@@ -117,6 +122,12 @@ INK_DARK_RATIO_MAX = 0.25
 INK_SAMPLE_SCALE = 0.6
 MIN_BOX_SIZE_PX = 12
 MIN_BOX_AREA_PX = 320
+CV_SCAN_ENABLED = os.getenv("CV_SCAN_ENABLED", "1") == "1"
+CV_SEARCH_WIDTH_PX = int(os.getenv("CV_SEARCH_WIDTH_PX", "220"))
+CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
+CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
+CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
+CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
 
 PROMPT_TEMPLATE = """
 Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
@@ -200,6 +211,9 @@ RESPONSE_SCHEMA = {
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+CV_SCAN_AVAILABLE = CV_SCAN_ENABLED and cv_tools is not None
+if CV_SCAN_ENABLED and not CV_SCAN_AVAILABLE:
+    logger.warning("CV scan enabled but OpenCV is unavailable; skipping vision correction.")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-change-me")
@@ -1547,6 +1561,19 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
             if not isinstance(raw_items, list):
                 raw_items = raw_response.get("boxes", [])
             boxes = sanitize_boxes(raw_items, page_index, llm_size)
+            if CV_SCAN_AVAILABLE and boxes:
+                try:
+                    boxes = cv_tools.fix_box_overlaps_with_vision(
+                        image_path,
+                        boxes,
+                        search_width_px=CV_SEARCH_WIDTH_PX,
+                        padding_px=CV_PADDING_PX,
+                        min_width_px=CV_MIN_WIDTH_PX,
+                        strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
+                        threshold=CV_THRESHOLD,
+                    )
+                except Exception as exc:
+                    logger.warning("Vision correction (pre-filter) failed on page %s: %s", page_index, exc)
             boxes = filter_filled_boxes(image, boxes)
             if not NO_OCR and any(
                 clean_anchor_text(str(box.get("anchor", "")).strip())
@@ -1567,6 +1594,19 @@ def process_page(job_id: str, page_index: int, image_path: Path, pdf_path: Path 
                         )
                     else:
                         boxes = align_boxes_to_anchor_words(boxes, ocr_words_for_alignment)
+            if CV_SCAN_AVAILABLE and boxes:
+                try:
+                    boxes = cv_tools.fix_box_overlaps_with_vision(
+                        image_path,
+                        boxes,
+                        search_width_px=CV_SEARCH_WIDTH_PX,
+                        padding_px=CV_PADDING_PX,
+                        min_width_px=CV_MIN_WIDTH_PX,
+                        strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
+                        threshold=CV_THRESHOLD,
+                    )
+                except Exception as exc:
+                    logger.warning("Vision correction (post-align) failed on page %s: %s", page_index, exc)
 
             if DEBUG_OCR_LAYER and not NO_OCR:
                 ocr_words_debug = []
