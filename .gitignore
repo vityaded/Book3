@@ -33,3 +33,13 @@ dist/
 # Generated job artifacts
 data/jobs/
 static/jobs/
+
+# Local workbook overlays and renders
+manual_jsons/
+manual_process/
+
+# Local skills installed for Codex
+skills/
+
+# Local example PDFs (large)
+examples/*.pdf
