@@ -127,7 +127,7 @@ CV_SEARCH_WIDTH_PX = int(os.getenv("CV_SEARCH_WIDTH_PX", "220"))
 CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
 CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
 CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
-CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
+CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "220"))
 CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
 CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
@@ -524,6 +524,84 @@ def convert_image_to_png(image_path: Path, output_dir: Path) -> Path:
     output_path = output_dir / "page_1.png"
     image.save(output_path, format="PNG")
     return output_path
+
+
+def load_boxes_json(json_path: Path) -> dict[int, list]:
+    raw_text = json_path.read_text(encoding="utf-8")
+    data = json.loads(raw_text)
+    page_boxes: dict[int, list] = {}
+
+    def extract_items(value):
+        if isinstance(value, dict):
+            for key in ("items", "boxes", "targets", "answers", "blanks", "target_boxes"):
+                candidate = value.get(key)
+                if isinstance(candidate, list):
+                    return candidate
+            return None
+        if isinstance(value, list):
+            return value
+        return None
+
+    def add_page(page_num, items):
+        if not isinstance(page_num, int):
+            return
+        if not isinstance(items, list):
+            return
+        page_boxes[page_num] = items
+
+    if isinstance(data, list):
+        add_page(1, data)
+    elif isinstance(data, dict):
+        pages_value = None
+        for key in ("pages", "items_by_page", "page_boxes"):
+            if key in data:
+                pages_value = data.get(key)
+                break
+
+        if isinstance(pages_value, list):
+            for idx, page in enumerate(pages_value, start=1):
+                page_num = idx
+                if isinstance(page, dict):
+                    page_num = page.get("page") or page.get("page_index") or page.get("number") or page.get("index") or idx
+                    try:
+                        page_num = int(page_num)
+                    except (TypeError, ValueError):
+                        page_num = idx
+                    items = extract_items(page)
+                else:
+                    items = extract_items(page)
+                add_page(page_num, items)
+        elif isinstance(pages_value, dict):
+            for key, value in pages_value.items():
+                try:
+                    page_num = int(key)
+                except (TypeError, ValueError):
+                    page_num = value.get("page") if isinstance(value, dict) else None
+                    try:
+                        page_num = int(page_num)
+                    except (TypeError, ValueError):
+                        page_num = None
+                items = extract_items(value)
+                add_page(page_num, items)
+
+        if not page_boxes:
+            if data and all(str(key).isdigit() for key in data.keys()):
+                for key, value in data.items():
+                    items = extract_items(value)
+                    try:
+                        page_num = int(key)
+                    except (TypeError, ValueError):
+                        continue
+                    add_page(page_num, items)
+
+        if not page_boxes:
+            items = extract_items(data)
+            add_page(1, items)
+
+    if not page_boxes:
+        raise ValueError("No boxes found in JSON (expected items/boxes list or pages mapping).")
+
+    return page_boxes
 
 
 def prepare_image_for_llm(image: Image.Image) -> Image.Image:
@@ -1572,6 +1650,7 @@ def process_page(
     image_path: Path,
     pdf_path: Path | None = None,
     cv_debug: bool = False,
+    precomputed_boxes: list | None = None,
 ) -> dict:
     error = ""
     boxes = []
@@ -1580,14 +1659,18 @@ def process_page(
     with Image.open(image_path) as image:
         image = image.convert("RGB")
         width, height = image.size
-        llm_image = prepare_image_for_llm(image)
-        llm_size = llm_image.size
         try:
-            raw_response = generate_boxes(llm_image)
-            raw_items = raw_response.get("items")
-            if not isinstance(raw_items, list):
-                raw_items = raw_response.get("boxes", [])
-            boxes = sanitize_boxes(raw_items, page_index, llm_size)
+            if precomputed_boxes is None:
+                llm_image = prepare_image_for_llm(image)
+                llm_size = llm_image.size
+                raw_response = generate_boxes(llm_image)
+                raw_items = raw_response.get("items")
+                if not isinstance(raw_items, list):
+                    raw_items = raw_response.get("boxes", [])
+                boxes = sanitize_boxes(raw_items, page_index, llm_size)
+            else:
+                raw_items = precomputed_boxes
+                boxes = sanitize_boxes(raw_items, page_index, image.size)
             if CV_SCAN_AVAILABLE and boxes:
                 try:
                     boxes = cv_tools.fix_box_overlaps_with_vision(
@@ -1726,6 +1809,7 @@ def process_images(
     image_paths: list[Path],
     pdf_path: Path | None = None,
     cv_debug: bool = False,
+    page_boxes: dict[int, list] | None = None,
 ) -> dict:
     pages = []
 
@@ -1734,6 +1818,9 @@ def process_images(
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = []
             for page_index, image_path in enumerate(image_paths, start=1):
+                precomputed = None
+                if page_boxes is not None and page_index in page_boxes:
+                    precomputed = page_boxes[page_index]
                 futures.append(
                     executor.submit(
                         process_page,
@@ -1742,6 +1829,7 @@ def process_images(
                         image_path,
                         pdf_path,
                         cv_debug=cv_debug,
+                        precomputed_boxes=precomputed,
                     )
                 )
             for future in as_completed(futures):
@@ -1749,7 +1837,12 @@ def process_images(
         pages.sort(key=lambda page: page["page"])
     else:
         for page_index, image_path in enumerate(image_paths, start=1):
-            pages.append(process_page(job_id, page_index, image_path, pdf_path, cv_debug=cv_debug))
+            precomputed = None
+            if page_boxes is not None and page_index in page_boxes:
+                precomputed = page_boxes[page_index]
+            pages.append(
+                process_page(job_id, page_index, image_path, pdf_path, cv_debug=cv_debug, precomputed_boxes=precomputed)
+            )
 
     return {
         "job_id": job_id,
@@ -1792,6 +1885,7 @@ def upload():
         return redirect(url_for("index"))
 
     file = request.files.get("file")
+    boxes_json = request.files.get("boxes_json")
     if not file or not file.filename:
         flash("Please choose a PDF or image to upload.")
         return redirect(url_for("index"))
@@ -1803,6 +1897,19 @@ def upload():
     job_id = uuid.uuid4().hex[:10]
     job_dir, job_static = create_job_dirs(job_id)
     cv_debug = resolve_cv_debug_request()
+
+    page_boxes = None
+    if boxes_json and boxes_json.filename:
+        if Path(boxes_json.filename).suffix.lower() != ".json":
+            flash("Boxes file must be a .json.")
+            return redirect(url_for("index"))
+        boxes_path = job_dir / "boxes.json"
+        boxes_json.save(boxes_path)
+        try:
+            page_boxes = load_boxes_json(boxes_path)
+        except Exception as exc:
+            flash(f"Invalid boxes JSON: {exc}")
+            return redirect(url_for("index"))
 
     ext = Path(file.filename).suffix.lower()
     upload_path = job_dir / f"upload{ext}"
@@ -1821,7 +1928,7 @@ def upload():
         flash(f"Failed to process file: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths, pdf_path=pdf_for_anchors, cv_debug=cv_debug)
+    result = process_images(job_id, image_paths, pdf_path=pdf_for_anchors, cv_debug=cv_debug, page_boxes=page_boxes)
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 
@@ -1833,6 +1940,7 @@ def paste():
         return redirect(url_for("index"))
 
     file = request.files.get("image")
+    boxes_json = request.files.get("boxes_json")
     if not file or not file.filename:
         flash("Paste an image into the clipboard box first.")
         return redirect(url_for("index"))
@@ -1845,6 +1953,19 @@ def paste():
     job_dir, job_static = create_job_dirs(job_id)
     cv_debug = resolve_cv_debug_request()
 
+    page_boxes = None
+    if boxes_json and boxes_json.filename:
+        if Path(boxes_json.filename).suffix.lower() != ".json":
+            flash("Boxes file must be a .json.")
+            return redirect(url_for("index"))
+        boxes_path = job_dir / "boxes.json"
+        boxes_json.save(boxes_path)
+        try:
+            page_boxes = load_boxes_json(boxes_path)
+        except Exception as exc:
+            flash(f"Invalid boxes JSON: {exc}")
+            return redirect(url_for("index"))
+
     upload_path = job_dir / "clipboard.png"
     file.save(upload_path)
 
@@ -1854,7 +1975,7 @@ def paste():
         flash(f"Failed to read clipboard image: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths, cv_debug=cv_debug)
+    result = process_images(job_id, image_paths, cv_debug=cv_debug, page_boxes=page_boxes)
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 

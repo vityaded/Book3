@@ -44,6 +44,8 @@
           <form id="upload-form" action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
             <input id="cv-debug-hidden" type="hidden" name="cv_debug" value="0" />
             <input class="file-input" type="file" name="file" accept="application/pdf,image/*" required />
+            <input class="file-input" type="file" name="boxes_json" accept="application/json,.json" />
+            <p class="helper">Optional: upload a JSON file with boxes/anchors for this page.</p>
             <button class="button" type="submit">Process file</button>
           </form>
         </div>
