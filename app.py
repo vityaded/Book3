@@ -8,6 +8,7 @@ import subprocess
 import time
 import uuid
 import argparse
+from datetime import datetime
 from difflib import SequenceMatcher
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -51,6 +52,7 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.1"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
 GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
+GEMINI_CODE_EXECUTION = os.getenv("GEMINI_CODE_EXECUTION", "1") == "1"
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 GEMINI_RETRY_BACKOFF_SEC = float(os.getenv("GEMINI_RETRY_BACKOFF_SEC", "1.5"))
@@ -126,6 +128,7 @@ CV_SCAN_ENABLED = os.getenv("CV_SCAN_ENABLED", "1") == "1"
 CV_SEARCH_WIDTH_PX = int(os.getenv("CV_SEARCH_WIDTH_PX", "220"))
 CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
 CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
+CV_MIN_WIDTH_RATIO = float(os.getenv("CV_MIN_WIDTH_RATIO", "0.6"))
 CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
 CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
 CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
@@ -151,30 +154,39 @@ CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
 CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
 
 PROMPT_TEMPLATE = """
-Task: Identify all user-fillable blanks (underlines, dotted lines, or empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
-
-For each fillable blank, identify two regions:
-- Anchor: The bounding box of the specific word or symbol immediately to the left of the blank (e.g., "Name:", "1.").
-- Target: The bounding box of the blank space itself.
+Task: Identify all user-fillable blanks (underlines, dotted/dashed lines, empty boxes, or long empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
 
 Coordinate System:
 - Use [ymin, xmin, ymax, xmax] relative to the image dimensions.
 - Scale: 0-1000 (integer values).
 
 Return JSON format:
-{"items": [{"anchor_box": [ymin, xmin, ymax, xmax], "target_box": [ymin, xmin, ymax, xmax], "label": "string", "filled": false}]}
+{"items": [{"target_box": [ymin, xmin, ymax, xmax], "label": "string", "filled": false}]}
 
 Rules:
-- The anchor_box and target_box must refer to the same line and the same blank.
-- The anchor_box should tightly bound only the anchor text/symbol, not the blank.
-- The target_box should tightly bound only the writable blank area.
+- The target_box must tightly bound only the writable blank area.
 - The bottom edge (ymax) of the target_box should align with the text baseline on that line.
 - Use tight heights that match the cap height of the surrounding text.
 - Include filled: true when the blank already contains handwriting or typed text.
+- Double check coordinates for accuracy.
+- Double check that all boxes are on lines, dotted lines, underlines, dashed lines, or empty spaces meant for user input.
+- Boxes must not overlap. If two blanks touch, split them into separate boxes.
 - If no blanks are found, return {"items": []}.
+
+Coverage rules (do not miss blanks):
+- Find every blank intended for user input: underlines, dotted/dashed lines, empty boxes, or long empty spaces between printed text.
+- Treat each contiguous blank segment as its own target_box (do not merge blanks separated by text).
+- Include short blanks (1–2 words) and long blanks, including those after parentheses or before punctuation.
+- Do not skip faint, thin, or partially obscured lines.
+- If uncertain whether a blank is intended for input, include it.
+
+Output rules (strict):
+- Return ONLY the JSON object. No prose, no markdown, no code fences.
+- The entire response must be a single JSON object that matches the schema.
 """.strip()
 
 RESPONSE_SCHEMA = {
+
     "type": "object",
     "properties": {
         "items": {
@@ -182,13 +194,6 @@ RESPONSE_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "anchor_box": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "description": "Anchor box [ymin, xmin, ymax, xmax] on a 0-1000 scale.",
-                    },
                     "target_box": {
                         "type": "array",
                         "items": {"type": "number"},
@@ -635,6 +640,59 @@ def extract_json_fragment(text: str) -> str | None:
     return None
 
 
+def extract_json_fragments(text: str) -> list[str]:
+    if not text:
+        return []
+
+    fragments = []
+    stack = []
+    start_idx = None
+    in_string = False
+    escaped = False
+
+    for idx, ch in enumerate(text):
+        if start_idx is None:
+            if ch in "{[":
+                start_idx = idx
+                stack = [ch]
+                in_string = False
+                escaped = False
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == "\"":
+                in_string = False
+            continue
+
+        if ch == "\"":
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch in "}]":
+            if not stack:
+                start_idx = None
+                continue
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                start_idx = None
+                stack = []
+                continue
+            if not stack:
+                fragments.append(text[start_idx : idx + 1])
+                start_idx = None
+                continue
+
+    return fragments
+
+
 def remove_trailing_commas(text: str) -> str:
     return re.sub(r",\s*([}\]])", r"\1", text)
 
@@ -708,6 +766,37 @@ def parse_json_response(text: str) -> dict:
     fragment = extract_json_fragment(stripped)
     if fragment:
         raw_candidates.append(fragment)
+    fragments = extract_json_fragments(stripped)
+    if fragments:
+        raw_candidates.extend(fragments)
+
+    def normalize_result(data):
+        if isinstance(data, list):
+            return {"boxes": data}
+        return data
+
+    def item_count(data) -> int:
+        if not isinstance(data, dict):
+            return 0
+        items = data.get("items")
+        if isinstance(items, list):
+            return len(items)
+        boxes = data.get("boxes")
+        if isinstance(boxes, list):
+            return len(boxes)
+        return 0
+
+    def scan_for_json(candidate: str) -> dict | None:
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(candidate):
+            if ch not in "{[":
+                continue
+            try:
+                data, _ = decoder.raw_decode(candidate, idx)
+            except json.JSONDecodeError:
+                continue
+            return normalize_result(data)
+        return None
 
     candidates = []
     for candidate in raw_candidates:
@@ -719,6 +808,8 @@ def parse_json_response(text: str) -> dict:
 
     seen = set()
     last_error = None
+    best_data = None
+    best_count = -1
     for candidate in candidates:
         if not candidate:
             continue
@@ -726,14 +817,23 @@ def parse_json_response(text: str) -> dict:
             if candidate in seen:
                 continue
             seen.add(candidate)
-            data = json.loads(candidate)
-            if isinstance(data, list):
-                return {"boxes": data}
-            return data
+            data = normalize_result(json.loads(candidate))
+            count = item_count(data)
+            if count > best_count:
+                best_count = count
+                best_data = data
         except json.JSONDecodeError as exc:
             last_error = exc
+            loose = scan_for_json(candidate)
+            if loose is not None:
+                count = item_count(loose)
+                if count > best_count:
+                    best_count = count
+                    best_data = loose
             continue
 
+    if best_data is not None:
+        return best_data
     if last_error:
         raise last_error
     raise json.JSONDecodeError("No JSON content found", text, 0)
@@ -851,6 +951,34 @@ def summarize_usage(usage) -> dict | None:
     }
 
 
+def extract_text_candidates(response) -> list[str]:
+    candidates = get_attr_or_key(response, "candidates") or []
+    texts = []
+    for candidate in candidates:
+        content = get_attr_or_key(candidate, "content")
+        parts = get_attr_or_key(content, "parts") or []
+        if not parts:
+            continue
+        text_parts = []
+        for part in parts:
+            text = get_attr_or_key(part, "text")
+            if text:
+                text_parts.append(str(text))
+        if text_parts:
+            texts.append("".join(text_parts))
+
+    if texts:
+        return texts
+
+    try:
+        fallback = response.text
+    except Exception:
+        fallback = None
+    if fallback:
+        return [str(fallback)]
+    return []
+
+
 def summarize_response(response) -> dict:
     summary = {"type": type(response).__name__}
     summary["prompt_feedback"] = summarize_prompt_feedback(get_attr_or_key(response, "prompt_feedback"))
@@ -879,6 +1007,26 @@ def build_safety_settings():
     return settings or None
 
 
+def build_tools():
+    if not GEMINI_CODE_EXECUTION:
+        return None
+    if types is None or not hasattr(types, "Tool"):
+        return None
+
+    tool = None
+    try:
+        tool = types.Tool(code_execution=types.ToolCodeExecution)
+    except Exception:
+        try:
+            tool = types.Tool(code_execution=types.ToolCodeExecution())
+        except Exception:
+            tool = None
+
+    if tool is None:
+        return None
+    return [tool]
+
+
 def build_generation_config():
     config_kwargs = {
         "temperature": GEMINI_TEMPERATURE,
@@ -891,6 +1039,10 @@ def build_generation_config():
     safety_settings = build_safety_settings()
     if safety_settings:
         config_kwargs["safety_settings"] = safety_settings
+
+    tools = build_tools()
+    if tools:
+        config_kwargs["tools"] = tools
 
     if GEMINI_THINKING_BUDGET >= 0 and types is not None and hasattr(types, "ThinkingConfig"):
         try:
@@ -1011,8 +1163,6 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         h = safe_float(raw.get("h"))
         coord_scale = safe_float(raw.get("coord_scale") or raw.get("coordinates_scale"))
 
-        anchor_coords = extract_box_coords(raw.get("anchor_box"))
-
         if None in (x, y, w, h):
             target_candidate = (
                 raw.get("target_box")
@@ -1041,49 +1191,11 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         if box_type not in {"answer", "exercise"}:
             box_type = "answer"
         label = str(raw.get("label", "")).strip()[:80]
-        anchor_raw = str(raw.get("anchor", raw.get("anchor_text", raw.get("after", "")))).strip()
-        anchor = clean_anchor_text(anchor_raw)
-        if anchor:
-            anchor_lower = anchor.lower()
-            if anchor_lower in {"none", "null", "nil", "na", "n/a"}:
-                anchor = ""
-            elif len(anchor.split()) != 1:
-                anchor = ""
-            else:
-                anchor = anchor[:40]
 
         if box_type == "answer":
             x, y, w, h = inset_box(x, y, w, h, BOX_INSET_RATIO)
             if w <= 0 or h <= 0:
                 continue
-
-        # If the model returned an anchor box, enforce that the target starts after it.
-        if anchor_coords is not None and width:
-            ax, ay, aw, ah = anchor_coords
-            ax, ay, aw, ah = normalize_box_values(ax, ay, aw, ah, width, height, coord_scale)
-            ax = min(max(ax, 0.0), 1.0)
-            ay = min(max(ay, 0.0), 1.0)
-            aw = min(max(aw, 0.0), 1.0 - ax)
-            ah = min(max(ah, 0.0), 1.0 - ay)
-            if aw > 0 and ah > 0:
-                # Vertical alignment: match anchor cap-height and baseline.
-                anchor_bottom = min(max(ay + ah, 0.0), 1.0)
-                target_h = min(max(ah, 0.0), anchor_bottom)
-                if target_h > 0:
-                    h = min(target_h, anchor_bottom)
-                    y = clamp(anchor_bottom - h, 0.0, 1.0 - h)
-
-                anchor_xmax = min(max(ax + aw, 0.0), 1.0)
-                padding = max(0.0, ANCHOR_TARGET_PADDING_RATIO)
-                x2 = x + w
-                min_width_norm = max(MIN_BOX_SIZE_PX / width, 0.001)
-                if x2 > min_width_norm:
-                    max_x = max(0.0, x2 - min_width_norm)
-                    new_x = max(x, anchor_xmax + padding)
-                    x = min(max(new_x, 0.0), max_x)
-                    w = x2 - x
-                    if w <= 0:
-                        continue
 
         cleaned.append(
             {
@@ -1094,7 +1206,7 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
                 "w": w,
                 "h": h,
                 "label": label,
-                "anchor": anchor,
+                "anchor": "",
             }
         )
 
@@ -1474,10 +1586,9 @@ def generate_boxes(image: Image.Image) -> dict:
         if raw_json:
             logger.info("Gemini response raw: %s", clip_text(raw_json, GEMINI_LOG_MAX_CHARS))
 
-    try:
-        text = response.text or ""
-    except Exception as exc:
-        logger.error("Gemini response missing text: %s", exc)
+    text_candidates = extract_text_candidates(response)
+    if not text_candidates:
+        logger.error("Gemini response missing text parts.")
         logger.error("Gemini response summary: %s", json.dumps(summarize_response(response), ensure_ascii=True))
         raw_json = None
         if hasattr(response, "model_dump"):
@@ -1497,14 +1608,21 @@ def generate_boxes(image: Image.Image) -> dict:
                 raw_json = None
         if raw_json:
             logger.error("Gemini response raw: %s", clip_text(raw_json, GEMINI_LOG_MAX_CHARS))
-        raise
+        raise ValueError("Gemini returned no text parts; see logs for details.")
 
-    if not text.strip():
-        logger.error("Gemini returned empty text response.")
-        logger.error("Gemini response summary: %s", json.dumps(summarize_response(response), ensure_ascii=True))
-        raise ValueError("Gemini returned empty response; see logs for safety ratings.")
+    last_error = None
+    for text in text_candidates:
+        if not text or not text.strip():
+            continue
+        try:
+            return parse_json_response(text)
+        except Exception as exc:
+            last_error = exc
+            continue
 
-    return parse_json_response(text)
+    if last_error:
+        raise last_error
+    raise ValueError("Gemini returned empty text response; see logs for safety ratings.")
 
 
 def looks_filled_box(image: Image.Image, box: dict) -> bool:
@@ -1566,6 +1684,14 @@ def filter_filled_boxes(image: Image.Image, boxes: list[dict]) -> list[dict]:
     return filtered
 
 
+def strip_cv_internal_fields(boxes: list[dict]) -> None:
+    """Remove temporary CV keys before persisting boxes."""
+    for box in boxes:
+        if isinstance(box, dict):
+            box.pop("_cv_orig_w_px", None)
+            box.pop("_cv_orig_h_px", None)
+
+
 def process_page(
     job_id: str,
     page_index: int,
@@ -1575,6 +1701,7 @@ def process_page(
 ) -> dict:
     error = ""
     boxes = []
+    gemini_boxes = []
     ocr_debug = []
     ocr_debug_total = 0
     with Image.open(image_path) as image:
@@ -1588,6 +1715,7 @@ def process_page(
             if not isinstance(raw_items, list):
                 raw_items = raw_response.get("boxes", [])
             boxes = sanitize_boxes(raw_items, page_index, llm_size)
+            gemini_boxes = [dict(box) for box in boxes]
             if CV_SCAN_AVAILABLE and boxes:
                 try:
                     boxes = cv_tools.fix_box_overlaps_with_vision(
@@ -1596,6 +1724,7 @@ def process_page(
                         search_width_px=CV_SEARCH_WIDTH_PX,
                         padding_px=CV_PADDING_PX,
                         min_width_px=CV_MIN_WIDTH_PX,
+                        min_width_ratio=CV_MIN_WIDTH_RATIO,
                         strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
@@ -1622,25 +1751,6 @@ def process_page(
                 except Exception as exc:
                     logger.warning("Vision correction (pre-filter) failed on page %s: %s", page_index, exc)
             boxes = filter_filled_boxes(image, boxes)
-            if not NO_OCR and any(
-                clean_anchor_text(str(box.get("anchor", "")).strip())
-                for box in boxes
-                if box.get("type") == "answer"
-            ):
-                ocr_words_for_alignment = []
-                used_pdf_words = False
-                if pdf_path is not None:
-                    ocr_words_for_alignment = extract_text_words_from_pdf_page(pdf_path, page_index)
-                    used_pdf_words = bool(ocr_words_for_alignment)
-                if not ocr_words_for_alignment:
-                    ocr_words_for_alignment = extract_text_words_from_image(image)
-                if ocr_words_for_alignment:
-                    if used_pdf_words:
-                        boxes = align_boxes_to_anchor_words(
-                            boxes, ocr_words_for_alignment, pdf_path=pdf_path, page_number=page_index
-                        )
-                    else:
-                        boxes = align_boxes_to_anchor_words(boxes, ocr_words_for_alignment)
             if CV_SCAN_AVAILABLE and boxes:
                 try:
                     boxes = cv_tools.fix_box_overlaps_with_vision(
@@ -1649,6 +1759,7 @@ def process_page(
                         search_width_px=CV_SEARCH_WIDTH_PX,
                         padding_px=CV_PADDING_PX,
                         min_width_px=CV_MIN_WIDTH_PX,
+                        min_width_ratio=CV_MIN_WIDTH_RATIO,
                         strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
@@ -1706,12 +1817,15 @@ def process_page(
                     label = f"step_{idx + 1}"
                 cv_debug_step_labels.append(label)
 
+    strip_cv_internal_fields(boxes)
+
     return {
         "page": page_index,
         "image": f"jobs/{job_id}/{image_path.name}",
         "width": width,
         "height": height,
         "boxes": boxes,
+        "gemini_boxes": gemini_boxes,
         "ocr_words": ocr_debug,
         "ocr_words_total": ocr_debug_total,
         "cv_debug": cv_debug,
@@ -1772,6 +1886,46 @@ def load_result(job_id: str) -> dict:
     return json.loads(result_path.read_text(encoding="utf-8"))
 
 
+def format_job_timestamp(timestamp: float) -> str:
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def list_jobs() -> list[dict]:
+    jobs = []
+    if not JOBS_DIR.exists():
+        return jobs
+
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        result_path = job_dir / "result.json"
+        if not result_path.exists():
+            continue
+        try:
+            job_data = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pages = job_data.get("pages")
+        page_count = len(pages) if isinstance(pages, list) else 0
+        updated_at = result_path.stat().st_mtime
+        jobs.append(
+            {
+                "job_id": job_dir.name,
+                "model": str(job_data.get("model", "")).strip(),
+                "pages": page_count,
+                "updated_at": updated_at,
+                "updated_at_display": format_job_timestamp(updated_at),
+                "debug_cv": bool(job_data.get("debug_cv")),
+            }
+        )
+
+    jobs.sort(key=lambda item: item["updated_at"], reverse=True)
+    return jobs
+
+
 def resolve_cv_debug_request() -> bool:
     """Resolve CV debug mode from request args/form, falling back to env."""
     requested = request.args.get("cv_debug") or request.form.get("cv_debug")
@@ -1782,7 +1936,7 @@ def resolve_cv_debug_request() -> bool:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", jobs=list_jobs())
 
 
 @app.route("/upload", methods=["POST"])
@@ -1856,6 +2010,149 @@ def paste():
 
     result = process_images(job_id, image_paths, cv_debug=cv_debug)
     save_result(job_dir, result)
+    return redirect(url_for("result", job_id=job_id))
+
+
+@app.route("/redo_cv/<job_id>", methods=["POST"])
+def redo_cv(job_id: str):
+    if not CV_SCAN_AVAILABLE:
+        flash("CV scan is unavailable (OpenCV missing).")
+        return redirect(url_for("index"))
+
+    try:
+        job = load_result(job_id)
+    except FileNotFoundError:
+        abort(404)
+
+    cv_debug = resolve_cv_debug_request()
+    pages = job.get("pages")
+    if not isinstance(pages, list):
+        flash("Job data is missing pages.")
+        return redirect(url_for("index"))
+
+    updated_pages = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        image_rel = page.get("image")
+        image_path = STATIC_DIR / image_rel if image_rel else None
+
+        base_boxes = page.get("gemini_boxes")
+        if isinstance(base_boxes, list):
+            boxes = base_boxes
+        else:
+            boxes = page.get("boxes")
+        if not isinstance(boxes, list):
+            boxes = []
+
+        working_boxes = []
+        for box in boxes:
+            if isinstance(box, dict):
+                box_copy = dict(box)
+                box_copy.pop("cv_debug_steps", None)
+                box_copy.pop("_cv_orig_w_px", None)
+                box_copy.pop("_cv_orig_h_px", None)
+                working_boxes.append(box_copy)
+            else:
+                working_boxes.append(box)
+
+        if image_path and image_path.exists() and working_boxes:
+            try:
+                working_boxes = cv_tools.fix_box_overlaps_with_vision(
+                    image_path,
+                    working_boxes,
+                    search_width_px=CV_SEARCH_WIDTH_PX,
+                    padding_px=CV_PADDING_PX,
+                    min_width_px=CV_MIN_WIDTH_PX,
+                    min_width_ratio=CV_MIN_WIDTH_RATIO,
+                    strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
+                    threshold=CV_THRESHOLD,
+                    scan_top_ratio=CV_SCAN_TOP_RATIO,
+                    scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
+                    edge_scan_px=CV_EDGE_SCAN_PX,
+                    underline_enabled=CV_UNDERLINE_ENABLED,
+                    underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
+                    underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
+                    underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
+                    underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
+                    underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
+                    underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
+                    underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
+                    underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
+                    underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
+                    underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                    underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
+                    underline_use_otsu=CV_UNDERLINE_USE_OTSU,
+                    underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
+                    underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    debug=cv_debug,
+                    debug_pass_name="pre_filter",
+                )
+                working_boxes = cv_tools.fix_box_overlaps_with_vision(
+                    image_path,
+                    working_boxes,
+                    search_width_px=CV_SEARCH_WIDTH_PX,
+                    padding_px=CV_PADDING_PX,
+                    min_width_px=CV_MIN_WIDTH_PX,
+                    min_width_ratio=CV_MIN_WIDTH_RATIO,
+                    strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
+                    threshold=CV_THRESHOLD,
+                    scan_top_ratio=CV_SCAN_TOP_RATIO,
+                    scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
+                    edge_scan_px=CV_EDGE_SCAN_PX,
+                    underline_enabled=CV_UNDERLINE_ENABLED,
+                    underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
+                    underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
+                    underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
+                    underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
+                    underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
+                    underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
+                    underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
+                    underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
+                    underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
+                    underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
+                    underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
+                    underline_use_otsu=CV_UNDERLINE_USE_OTSU,
+                    underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
+                    underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    debug=cv_debug,
+                    debug_pass_name="post_align",
+                )
+            except Exception as exc:
+                logger.warning("Vision correction (redo) failed on page %s: %s", page.get("page"), exc)
+        elif image_path and not image_path.exists():
+            logger.warning("Redo CV skipped missing image: %s", image_path)
+
+        new_page = dict(page)
+        strip_cv_internal_fields(working_boxes)
+        new_page["boxes"] = working_boxes
+        new_page["cv_debug"] = cv_debug
+        new_page["cv_debug_step_count"] = 0
+        new_page["cv_debug_step_labels"] = []
+        if cv_debug:
+            debug_steps_lists = [
+                box.get("cv_debug_steps")
+                for box in working_boxes
+                if isinstance(box, dict) and box.get("cv_debug_steps")
+            ]
+            if debug_steps_lists:
+                cv_debug_step_count = max(len(steps) for steps in debug_steps_lists)
+                reference_steps = max(debug_steps_lists, key=len)
+                labels = []
+                for idx in range(cv_debug_step_count):
+                    if idx < len(reference_steps):
+                        labels.append(str(reference_steps[idx].get("step", f"step_{idx + 1}")))
+                    else:
+                        labels.append(f"step_{idx + 1}")
+                new_page["cv_debug_step_count"] = cv_debug_step_count
+                new_page["cv_debug_step_labels"] = labels
+        updated_pages.append(new_page)
+
+    job["pages"] = updated_pages
+    job["debug_cv"] = cv_debug
+    job_dir = JOBS_DIR / job_id
+    save_result(job_dir, job)
+    flash(f"CV alignment updated for job {job_id}.")
     return redirect(url_for("result", job_id=job_id))
 
 
