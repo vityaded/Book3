@@ -34,8 +34,8 @@ def _normalized_box_to_pixels(box: dict, width: int, height: int) -> tuple[int, 
 
     x1 = _clamp_int(x1, 0, width - 1)
     y1 = _clamp_int(y1, 0, height - 1)
-    x2 = _clamp_int(x2, 0, width)
-    y2 = _clamp_int(y2, 0, height)
+    x2 = _clamp_int(x2, 1, width)
+    y2 = _clamp_int(y2, 1, height)
 
     if x2 <= x1 or y2 <= y1:
         return None
@@ -55,7 +55,7 @@ def _update_box_from_pixels(box: dict, x1: int, x2: int, width: int) -> None:
 
 
 def _update_box_y_from_pixels(box: dict, y1: int, y2: int, height: int) -> None:
-    """Write pixel y-bounds back into a normalized box while preserving height."""
+    """Write pixel y-bounds back into a normalized box."""
     y1 = _clamp_int(y1, 0, height - 1)
     y2 = _clamp_int(y2, 1, height)
     if y2 <= y1:
@@ -65,215 +65,264 @@ def _update_box_y_from_pixels(box: dict, y1: int, y2: int, height: int) -> None:
     box["h"] = (y2 - y1) / height
 
 
-def _segments_from_row(row_mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return contiguous ink segments as (start, end) inclusive indices."""
-    segments: list[tuple[int, int]] = []
-    in_segment = False
-    seg_start = 0
-    for idx, value in enumerate(row_mask):
-        if value and not in_segment:
-            in_segment = True
-            seg_start = idx
-        elif not value and in_segment:
-            segments.append((seg_start, idx - 1))
-            in_segment = False
-    if in_segment:
-        segments.append((seg_start, len(row_mask) - 1))
-    return segments
-
-
-def _analyze_row_pattern(
-    row_mask: np.ndarray,
+def _binarize_region(
+    gray: np.ndarray,
     *,
-    coverage_min: float,
-    segments_min: int,
-    gap_cv_max: float,
-) -> dict | None:
-    """Analyze a single row for underline-like patterns."""
-    if row_mask.size == 0:
-        return None
-    ink_idx = np.flatnonzero(row_mask)
-    if ink_idx.size == 0:
+    threshold: int,
+    use_adaptive: bool = True,
+) -> np.ndarray | None:
+    if gray.size == 0:
         return None
 
-    width = int(row_mask.size)
-    coverage_ratio = float(ink_idx.size / max(width, 1))
-    segments = _segments_from_row(row_mask.astype(bool))
-    segments_count = len(segments)
-    span_start = int(ink_idx.min())
-    span_end = int(ink_idx.max())
-    center_x = int(np.median(ink_idx))
-
-    gaps: list[int] = []
-    for i in range(len(segments) - 1):
-        gaps.append(max(0, segments[i + 1][0] - segments[i][1] - 1))
-
-    gap_cv = float("inf")
-    if gaps:
-        mean_gap = float(np.mean(gaps))
-        if mean_gap > 0:
-            gap_cv = float(np.std(gaps) / mean_gap)
-        else:
-            gap_cv = 0.0
-
-    dotted_like = segments_count >= segments_min and (gap_cv <= gap_cv_max or coverage_ratio >= coverage_min * 0.7)
-    solid_like = coverage_ratio >= coverage_min
-    real_line = bool(solid_like or dotted_like)
-
-    # Score: prefer broader coverage and consistent dotted patterns.
-    segment_term = min(segments_count, 8) / 8.0
-    if gaps and np.isfinite(gap_cv):
-        gap_term = max(0.0, 1.0 - min(gap_cv / max(gap_cv_max, 1e-6), 1.5))
+    if use_adaptive and min(gray.shape[:2]) >= 8:
+        block = max(15, min(gray.shape[:2]) // 2 * 2 + 1)
+        block = _clamp_int(block, 15, 51)
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block,
+            9,
+        )
     else:
-        gap_term = 0.0
-    score = coverage_ratio * 1.6 + segment_term * 0.25 + gap_term * 0.25
-    if real_line:
-        score += 0.35
+        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
 
-    return {
-        "coverage_ratio": coverage_ratio,
-        "segments_count": segments_count,
-        "gap_cv": gap_cv,
-        "span_start": span_start,
-        "span_end": span_end,
-        "center_x": center_x,
-        "real_line": real_line,
-        "score": float(score),
-    }
+    if np.count_nonzero(binary) == 0:
+        _, binary_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        if np.count_nonzero(binary_otsu) > 0:
+            binary = binary_otsu
+
+    return binary
 
 
-def _detect_underline_in_region(
+def _middle_band(y1: int, y2: int, ratio: float) -> tuple[int, int]:
+    box_h = y2 - y1
+    band_h = max(3, int(box_h * ratio))
+    mid = y1 + box_h // 2
+    band_y1 = _clamp_int(mid - band_h // 2, y1, max(y1, y2 - 1))
+    band_y2 = _clamp_int(band_y1 + band_h, band_y1 + 1, y2)
+    return band_y1, band_y2
+
+
+def _edge_avoid(
+    binary_band: np.ndarray,
+    *,
+    band_x1: int,
+    x1: int,
+    x2: int,
+    edge_scan_px: int,
+    padding_px: int,
+) -> tuple[int, int, bool, int | None, int | None]:
+    width = binary_band.shape[1]
+
+    def _region_rel(start_x: int, end_x: int) -> tuple[int, int]:
+        rel_start = _clamp_int(start_x - band_x1, 0, width)
+        rel_end = _clamp_int(end_x - band_x1, 0, width)
+        if rel_end < rel_start:
+            rel_start, rel_end = rel_end, rel_start
+        return rel_start, rel_end
+
+    def _rightmost_ink(start_x: int, end_x: int) -> int | None:
+        rel_start, rel_end = _region_rel(start_x, end_x)
+        if rel_end - rel_start < 2:
+            return None
+        region = binary_band[:, rel_start:rel_end]
+        coords = cv2.findNonZero(region)
+        if coords is None:
+            return None
+        return band_x1 + rel_start + int(np.max(coords[:, 0, 0]))
+
+    def _leftmost_ink(start_x: int, end_x: int) -> int | None:
+        rel_start, rel_end = _region_rel(start_x, end_x)
+        if rel_end - rel_start < 2:
+            return None
+        region = binary_band[:, rel_start:rel_end]
+        coords = cv2.findNonZero(region)
+        if coords is None:
+            return None
+        return band_x1 + rel_start + int(np.min(coords[:, 0, 0]))
+
+    left_edge_ink = _rightmost_ink(x1, min(x1 + edge_scan_px, x2))
+    right_edge_ink = _leftmost_ink(max(x2 - edge_scan_px, x1), x2)
+
+    overlap = left_edge_ink is not None or right_edge_ink is not None
+
+    if not overlap:
+        return x1, x2, False, left_edge_ink, right_edge_ink
+
+    new_x1 = x1
+    new_x2 = x2
+    if left_edge_ink is not None:
+        new_x1 = max(new_x1, left_edge_ink + padding_px)
+    if right_edge_ink is not None:
+        new_x2 = min(new_x2, right_edge_ink - padding_px)
+
+    return new_x1, new_x2, True, left_edge_ink, right_edge_ink
+
+
+def _collect_components(
+    binary: np.ndarray,
+    *,
+    min_h: int,
+    max_h: int,
+    min_area: int,
+    max_aspect: float,
+) -> list[tuple[int, int, int, int]]:
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    comps: list[tuple[int, int, int, int]] = []
+    for idx in range(1, num):
+        x, y, w, h, area = stats[idx]
+        if h < min_h or h > max_h:
+            continue
+        if area < min_area:
+            continue
+        if w <= 1:
+            continue
+        aspect = w / max(h, 1)
+        if aspect > max_aspect:
+            continue
+        comps.append((x, y, w, h))
+    return comps
+
+
+def _estimate_cap_height(
     img: np.ndarray,
     *,
     x1: int,
-    x2: int,
     y1: int,
-    y2: int,
-    threshold: int,
-    coverage_min: float,
-    segments_min: int,
-    gap_cv_max: float,
-    use_otsu: bool = True,
-    blur_ksize: int = 3,
-) -> dict | None:
-    """Detect the best underline-like row within a region."""
-    if x2 - x1 < 6 or y2 - y1 < 4:
-        return None
-
-    strip = img[y1:y2, x1:x2]
-    if strip.size == 0:
-        return None
-
-    def analyze_binary(binary: np.ndarray) -> tuple[dict | None, dict | None]:
-        best_line: dict | None = None
-        best_fragment: dict | None = None
-        for row_idx in range(binary.shape[0]):
-            row = binary[row_idx, :] > 0
-            analysis = _analyze_row_pattern(
-                row,
-                coverage_min=coverage_min,
-                segments_min=segments_min,
-                gap_cv_max=gap_cv_max,
-            )
-            if analysis is None:
-                continue
-            analysis["row_idx"] = int(row_idx)
-            if analysis["real_line"]:
-                if best_line is None or analysis["score"] > best_line["score"]:
-                    best_line = analysis
-            else:
-                if best_fragment is None or analysis["score"] > best_fragment["score"]:
-                    best_fragment = analysis
-        return best_line, best_fragment
-
-    _, binary = cv2.threshold(strip, threshold, 255, cv2.THRESH_BINARY_INV)
-    best_line, best_fragment = analyze_binary(binary)
-
-    if best_line is None and use_otsu:
-        ksize = int(blur_ksize)
-        if ksize < 3:
-            ksize = 3
-        if ksize % 2 == 0:
-            ksize += 1
-        blurred = cv2.GaussianBlur(strip, (ksize, ksize), 0)
-        _, binary_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        best_line, best_fragment = analyze_binary(binary_otsu)
-
-    if best_line is not None:
-        row_idx = best_line["row_idx"]
-        underline_y = y1 + row_idx
-        span = (x1 + int(best_line["span_start"]), x1 + int(best_line["span_end"]))
-        return {
-            "real_line": True,
-            "underline_y": int(underline_y),
-            "span": span,
-            "analysis": best_line,
-        }
-
-    if best_fragment is not None:
-        row_idx = best_fragment["row_idx"]
-        fragment_y = y1 + row_idx
-        span = (x1 + int(best_fragment["span_start"]), x1 + int(best_fragment["span_end"]))
-        center_x = x1 + int(best_fragment["center_x"])
-        return {
-            "real_line": False,
-            "underline_y": int(fragment_y),
-            "span": span,
-            "center_x": int(center_x),
-            "analysis": best_fragment,
-        }
-
-    return None
-
-
-def _is_thin_line(
-    img: np.ndarray,
-    *,
-    x1: int,
     x2: int,
-    y: int,
+    y2: int,
+    search_width_px: int,
     threshold: int,
-    min_row_pixels: int,
-    max_rows_with_ink: int = 2,
-    center_ratio: float = 0.6,
-) -> bool:
-    """Heuristic: underline/dotted lines are usually 1-2px tall."""
+    scan_up_ratio: float,
+    scan_down_ratio: float,
+    row_ratio_min: float,
+    row_ratio_scale: float,
+    min_px: int,
+    max_scale: float,
+    max_shift_ratio: float,
+) -> tuple[int, int] | None:
     height, width = img.shape[:2]
-    if x2 - x1 < 4:
-        return False
-    y0 = max(0, y - 2)
-    y1 = min(height, y + 3)
-    if y1 <= y0:
-        return False
+    box_h = y2 - y1
+    box_w = x2 - x1
+    if box_h <= 0 or box_w <= 0:
+        return None
 
-    strip = img[y0:y1, x1:x2]
-    if strip.size == 0:
-        return False
+    scan_up = max(min_px, int(box_h * scan_up_ratio))
+    scan_down = max(2, int(box_h * scan_down_ratio))
+    window_y1 = _clamp_int(y1 - scan_up, 0, height - 1)
+    window_y2 = _clamp_int(y2 + scan_down, 1, height)
+    if window_y2 - window_y1 < min_px:
+        return None
 
-    _, binary = cv2.threshold(strip, threshold, 255, cv2.THRESH_BINARY_INV)
-    row_counts = np.count_nonzero(binary, axis=1)
-    total_ink = int(row_counts.sum())
-    if total_ink == 0:
-        return False
+    region_w = min(search_width_px, max(18, int(box_w * 0.9)))
+    if region_w < 6:
+        return None
 
-    center_idx = y - y0
-    if center_idx < 0 or center_idx >= row_counts.size:
-        return False
+    regions = []
+    left_x1 = max(0, x1 - region_w)
+    left_x2 = x1
+    if left_x2 - left_x1 >= 6:
+        regions.append((left_x1, left_x2))
+    right_x1 = x2
+    right_x2 = min(width, x2 + region_w)
+    if right_x2 - right_x1 >= 6:
+        regions.append((right_x1, right_x2))
 
-    rows_with_ink = sum(count >= min_row_pixels for count in row_counts)
-    if rows_with_ink > max_rows_with_ink:
-        return False
+    if not regions:
+        return None
 
-    center_count = int(row_counts[center_idx])
-    if (center_count / total_ink) < center_ratio:
-        return False
+    baseline_target = y2
+    best_candidate = None
 
-    return True
+    for rx1, rx2 in regions:
+        strip = img[window_y1:window_y2, rx1:rx2]
+        binary = _binarize_region(strip, threshold=threshold, use_adaptive=True)
+        if binary is None:
+            continue
 
+        # Light morphological cleanup to reduce pepper noise.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
-def _default_search_width_px(width: int) -> int:
-    # ~5% of the page width, bounded to keep scanning fast and consistent.
-    return _clamp_int(int(width * 0.05), 40, 140)
+        max_h = max(min_px, int(box_h * max_scale))
+        min_area = max(6, int((rx2 - rx1) * 0.01))
+        comps = _collect_components(
+            binary,
+            min_h=min_px,
+            max_h=max_h,
+            min_area=min_area,
+            max_aspect=6.0,
+        )
+
+        if comps:
+            bottoms = np.array([y + h for _, y, _, h in comps], dtype=np.float32)
+            heights = np.array([h for _, _, _, h in comps], dtype=np.float32)
+            global_bottoms = bottoms + window_y1
+
+            distances = np.abs(global_bottoms - baseline_target)
+            tol = max(8.0, box_h * 0.8)
+            near_mask = distances <= tol
+            if np.any(near_mask):
+                selected_bottoms = global_bottoms[near_mask]
+                selected_heights = heights[near_mask]
+            else:
+                idx_sorted = np.argsort(distances)[: min(12, len(distances))]
+                selected_bottoms = global_bottoms[idx_sorted]
+                selected_heights = heights[idx_sorted]
+
+            baseline = float(np.median(selected_bottoms))
+            height_median = float(np.median(selected_heights))
+            if height_median < min_px:
+                continue
+
+            height_median = min(height_median, max_h)
+            candidate = (baseline, height_median, len(selected_heights))
+            if best_candidate is None or candidate[2] > best_candidate[2]:
+                best_candidate = candidate
+
+        # Fallback projection if components are sparse.
+        if best_candidate is None:
+            row_counts = np.count_nonzero(binary, axis=1).astype(np.float32)
+            if row_counts.size == 0:
+                continue
+            if row_counts.max() <= 0:
+                continue
+            smoothed = np.convolve(row_counts, np.ones(5) / 5.0, mode="same")
+            max_val = float(smoothed.max())
+            if max_val <= 0:
+                continue
+            lower_half_start = int(smoothed.size * 0.45)
+            baseline_idx = int(lower_half_start + np.argmax(smoothed[lower_half_start:]))
+            threshold_ratio = max(row_ratio_min, max_val / max(rx2 - rx1, 1) * row_ratio_scale)
+            threshold_value = threshold_ratio * max(rx2 - rx1, 1)
+
+            top_idx = baseline_idx
+            for idx in range(baseline_idx, -1, -1):
+                if smoothed[idx] < threshold_value:
+                    break
+                top_idx = idx
+
+            height_px = baseline_idx - top_idx + 1
+            if height_px >= min_px:
+                baseline = window_y1 + baseline_idx
+                height_px = min(height_px, int(box_h * max_scale))
+                best_candidate = (float(baseline), float(height_px), 1)
+
+    if best_candidate is None:
+        return None
+
+    baseline, height_px, _ = best_candidate
+    max_shift = max(6, int(box_h * max_shift_ratio))
+    if abs(baseline - y2) > max_shift:
+        return None
+
+    new_y2 = int(round(baseline))
+    new_y1 = int(round(baseline - height_px))
+    new_y1 = _clamp_int(new_y1, 0, height - 1)
+    new_y2 = _clamp_int(new_y2, new_y1 + 1, height)
+    return new_y1, new_y2
 
 
 def fix_box_overlaps_with_vision(
@@ -284,29 +333,10 @@ def fix_box_overlaps_with_vision(
     padding_px: int = 6,
     min_width_px: int = 14,
     min_width_ratio: float = 0.6,
-    strip_half_height_px: int = 6,
-    threshold: int = 200,
-    scan_top_ratio: float = 0.3,
-    scan_bottom_ratio: float = 0.7,
     edge_scan_px: int | None = None,
-    edge_avoid_only: bool = False,
-    snap_left_enabled: bool = True,
-    underline_enabled: bool = True,
-    underline_band_top_ratio: float = 0.62,
-    underline_extra_bottom_px: int = 10,
-    underline_margin_x_px: int | None = None,
-    underline_row_ratio_min: float = 0.02,
-    underline_min_row_pixels: int = 12,
-    underline_line_coverage_min: float = 0.16,
-    underline_segments_min: int = 3,
-    underline_gap_cv_max: float = 1.4,
-    underline_below_scan_px: int = 28,
-    underline_below_margin_top_px: int = 2,
-    underline_below_ratio: float = 0.5,
-    underline_use_otsu: bool = True,
-    underline_blur_ksize: int = 3,
-    underline_threshold: int = 140,
-    cap_height_enabled: bool = False,
+    threshold: int = 200,
+    middle_band_ratio: float = 0.1,
+    cap_height_enabled: bool = True,
     cap_height_scan_up_ratio: float = 2.2,
     cap_height_scan_down_ratio: float = 0.6,
     cap_height_row_ratio_min: float = 0.03,
@@ -314,21 +344,13 @@ def fix_box_overlaps_with_vision(
     cap_height_min_px: int = 6,
     cap_height_max_scale: float = 2.2,
     cap_height_max_shift_ratio: float = 1.2,
-    cap_height_threshold: int | None = None,
     debug: bool = False,
     debug_pass_name: str | None = None,
 ) -> list[dict]:
     """
-    Use pixel scanning to push answer boxes away from ink under their edges.
-
-    This repo stores boxes as normalized {x, y, w, h} values. We scan a thin
-    horizontal strip centered on the box height, then:
-    - move left/right if letters are under the box edges,
-    - if an underline/dotted line is behind the box, lift the box so its
-      bottom aligns with that underline,
-    - snap the left edge to the nearest letters on the left,
-    - extend the right edge to the underline length when available.
-    - optionally set the box height to match the capital-letter height in the line.
+    Simplified CV alignment:
+    - only avoid ink at box edges (using the middle 10% of the box height),
+    - optionally set the box height to the detected cap height on the line.
     """
     image_path = Path(image_path)
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
@@ -341,45 +363,14 @@ def fix_box_overlaps_with_vision(
         return list(boxes)
 
     if search_width_px is None or search_width_px <= 0:
-        search_width_px = _default_search_width_px(width)
+        search_width_px = _clamp_int(int(width * 0.05), 40, 140)
 
     padding_px = max(0, int(padding_px))
     min_width_px = max(1, int(min_width_px))
     min_width_ratio = max(0.0, float(min_width_ratio))
-    strip_half_height_px = max(2, int(strip_half_height_px))
-    # Keep a very small hard minimum width to avoid collapsing the box.
-    min_width_floor_px = 3
-    scan_top_ratio = float(scan_top_ratio)
-    scan_bottom_ratio = float(scan_bottom_ratio)
-    if scan_bottom_ratio < scan_top_ratio:
-        scan_top_ratio, scan_bottom_ratio = scan_bottom_ratio, scan_top_ratio
-    scan_top_ratio = min(max(scan_top_ratio, 0.0), 1.0)
-    scan_bottom_ratio = min(max(scan_bottom_ratio, 0.0), 1.0)
-    underline_band_top_ratio = min(max(float(underline_band_top_ratio), 0.0), 1.0)
-    underline_extra_bottom_px = max(0, int(underline_extra_bottom_px))
-    underline_row_ratio_min = max(0.0, float(underline_row_ratio_min))
-    underline_min_row_pixels = max(1, int(underline_min_row_pixels))
-    underline_line_coverage_min = max(0.02, float(underline_line_coverage_min))
-    underline_segments_min = max(2, int(underline_segments_min))
-    underline_gap_cv_max = max(0.2, float(underline_gap_cv_max))
-    underline_below_scan_px = max(0, int(underline_below_scan_px))
-    underline_below_margin_top_px = max(0, int(underline_below_margin_top_px))
-    underline_below_ratio = max(0.0, float(underline_below_ratio))
-    underline_blur_ksize = max(1, int(underline_blur_ksize))
-    underline_threshold = max(0, min(255, int(underline_threshold)))
-    cap_height_scan_up_ratio = max(0.4, float(cap_height_scan_up_ratio))
-    cap_height_scan_down_ratio = max(0.0, float(cap_height_scan_down_ratio))
-    cap_height_row_ratio_min = max(0.0, float(cap_height_row_ratio_min))
-    cap_height_row_ratio_scale = max(0.05, float(cap_height_row_ratio_scale))
-    cap_height_min_px = max(2, int(cap_height_min_px))
-    cap_height_max_scale = max(0.5, float(cap_height_max_scale))
-    cap_height_max_shift_ratio = max(0.3, float(cap_height_max_shift_ratio))
-    if cap_height_threshold is None:
-        cap_height_threshold = threshold
-    else:
-        cap_height_threshold = max(0, min(255, int(cap_height_threshold)))
+    threshold = max(0, min(255, int(threshold)))
+    middle_band_ratio = max(0.02, min(0.2, float(middle_band_ratio)))
 
-    # Work on a concrete list and mutate in place for simplicity.
     box_list = list(boxes)
     modified = 0
 
@@ -387,33 +378,15 @@ def fix_box_overlaps_with_vision(
         if not isinstance(box, dict):
             continue
         if box.get("type") not in {None, "answer"}:
-            # Only adjust answer blanks; leave other box types untouched.
             continue
 
         bounds = _normalized_box_to_pixels(box, width, height)
         if bounds is None:
             continue
         x1, y1, x2, y2 = bounds
-        orig_box_h = y2 - y1
-        orig_box_w = x2 - x1
-        try:
-            ref_box_w = int(box.get("_cv_orig_w_px", orig_box_w))
-        except (TypeError, ValueError):
-            ref_box_w = orig_box_w
-        try:
-            ref_box_h = int(box.get("_cv_orig_h_px", orig_box_h))
-        except (TypeError, ValueError):
-            ref_box_h = orig_box_h
-        if ref_box_w <= 0:
-            ref_box_w = orig_box_w
-        if ref_box_h <= 0:
-            ref_box_h = orig_box_h
-        if "_cv_orig_w_px" not in box:
-            box["_cv_orig_w_px"] = int(ref_box_w)
-        if "_cv_orig_h_px" not in box:
-            box["_cv_orig_h_px"] = int(ref_box_h)
-
-        if x2 - x1 < min_width_floor_px:
+        orig_w = x2 - x1
+        orig_h = y2 - y1
+        if orig_w <= 0 or orig_h <= 0:
             continue
 
         steps_out = box.setdefault("cv_debug_steps", []) if debug else None
@@ -422,26 +395,17 @@ def fix_box_overlaps_with_vision(
         def _step_label(stage: str) -> str:
             return f"{pass_name}.{stage}" if pass_name else stage
 
-        def _norm(x1_n: int, x2_n: int, y1_n: int, y2_n: int) -> tuple[float, float, float, float]:
-            return (
-                x1_n / width,
-                y1_n / height,
-                (x2_n - x1_n) / width,
-                (y2_n - y1_n) / height,
-            )
-
         def _record(stage: str, x1_r: int, x2_r: int, y1_r: int, y2_r: int, note: str | None = None) -> None:
             if not debug or steps_out is None:
                 return
-            x_n, y_n, w_n, h_n = _norm(x1_r, x2_r, y1_r, y2_r)
             entry = {
                 "step": _step_label(stage),
                 "stage": stage,
                 "pass": pass_name,
-                "x": x_n,
-                "y": y_n,
-                "w": w_n,
-                "h": h_n,
+                "x": x1_r / width,
+                "y": y1_r / height,
+                "w": (x2_r - x1_r) / width,
+                "h": (y2_r - y1_r) / height,
                 "x1_px": int(x1_r),
                 "x2_px": int(x2_r),
                 "y1_px": int(y1_r),
@@ -450,490 +414,89 @@ def fix_box_overlaps_with_vision(
             if note:
                 entry["note"] = note
             steps_out.append(entry)
-            logger.info(
-                "CV_DEBUG page_box=%s step=%s x=%.4f y=%.4f w=%.4f h=%.4f note=%s",
-                box.get("id", "?"),
-                entry["step"],
-                entry["x"],
-                entry["y"],
-                entry["w"],
-                entry["h"],
-                entry.get("note", ""),
-            )
 
-        _record("initial", x1, x2, y1, y2, note=f"w_px={orig_box_w} h_px={orig_box_h}")
+        _record("initial", x1, x2, y1, y2)
 
-        def _middle_band(y1_b: int, y2_b: int) -> tuple[int, int] | None:
-            box_h_b = y2_b - y1_b
-            band_top_b = y1_b + int(box_h_b * scan_top_ratio)
-            band_bottom_b = y1_b + int(box_h_b * scan_bottom_ratio)
-            band_top_b = _clamp_int(band_top_b, y1_b, max(y1_b, y2_b - 1))
-            band_bottom_b = _clamp_int(band_bottom_b, min(y2_b, y1_b + 1), y2_b)
+        # Edge avoidance using the middle band only.
+        band_y1, band_y2 = _middle_band(y1, y2, middle_band_ratio)
+        band_x1 = max(0, x1 - search_width_px)
+        band_x2 = min(width, x2 + search_width_px)
+        band_strip = img[band_y1:band_y2, band_x1:band_x2]
 
-            if band_bottom_b - band_top_b < 4:
-                mid_y_b = (y1_b + y2_b) // 2
-                y_top_b = _clamp_int(mid_y_b - strip_half_height_px, 0, height - 1)
-                y_bottom_b = _clamp_int(mid_y_b + strip_half_height_px, 1, height)
-            else:
-                y_top_b = band_top_b
-                y_bottom_b = band_bottom_b
-            if y_bottom_b <= y_top_b:
-                return None
-            return y_top_b, y_bottom_b
-
-        band = _middle_band(y1, y2)
-        if band is None:
-            continue
-        y_top, y_bottom = band
-
-        # Build one binary mask over a wider band around the box so we can
-        # query left/outside and inside-edge regions cheaply.
-        band_start_x = max(0, x1 - search_width_px)
-        band_end_x = min(width, x2 + search_width_px)
-        if band_end_x - band_start_x < 8:
-            continue
-
-        band_strip = img[y_top:y_bottom, band_start_x:band_end_x]
-        if band_strip.size == 0:
-            continue
-
-        # Threshold for "ink": darker pixels become white (255) in the mask.
-        _, band_binary = cv2.threshold(band_strip, threshold, 255, cv2.THRESH_BINARY_INV)
-
-        band_width = band_end_x - band_start_x
-
-        def _region_rel(start_x: int, end_x: int) -> tuple[int, int]:
-            rel_start = _clamp_int(start_x - band_start_x, 0, band_width)
-            rel_end = _clamp_int(end_x - band_start_x, 0, band_width)
-            if rel_end < rel_start:
-                rel_start, rel_end = rel_end, rel_start
-            return rel_start, rel_end
-
-        def _rightmost_ink(start_x: int, end_x: int) -> int | None:
-            rel_start, rel_end = _region_rel(start_x, end_x)
-            if rel_end - rel_start < 2:
-                return None
-            region = band_binary[:, rel_start:rel_end]
-            coords = cv2.findNonZero(region)
-            if coords is None:
-                return None
-            return band_start_x + rel_start + int(np.max(coords[:, 0, 0]))
-
-        def _leftmost_ink(start_x: int, end_x: int) -> int | None:
-            rel_start, rel_end = _region_rel(start_x, end_x)
-            if rel_end - rel_start < 2:
-                return None
-            region = band_binary[:, rel_start:rel_end]
-            coords = cv2.findNonZero(region)
-            if coords is None:
-                return None
-            return band_start_x + rel_start + int(np.min(coords[:, 0, 0]))
-
-        def _ink_count(start_x: int, end_x: int) -> int:
-            rel_start, rel_end = _region_rel(start_x, end_x)
-            if rel_end <= rel_start:
-                return 0
-            return int(np.count_nonzero(band_binary[:, rel_start:rel_end]))
-
-        # How much of each edge to inspect for ink under the box itself.
-        local_edge_scan_px = edge_scan_px
-        if local_edge_scan_px is None or local_edge_scan_px <= 0:
-            local_edge_scan_px = _clamp_int(int((x2 - x1) * 0.05), 5, min(120, x2 - x1))
-        local_edge_scan_px = min(local_edge_scan_px, x2 - x1)
-        if local_edge_scan_px < 5:
-            continue
-
-        # 1) If ink exists under the left edge of the box, push right.
-        int_left_start = x1
-        int_left_end = min(x1 + local_edge_scan_px, x2)
-        left_edge_ink = _rightmost_ink(int_left_start, int_left_end)
-        desired_x1 = x1
-        if left_edge_ink is not None:
-            desired_x1 = max(desired_x1, left_edge_ink + padding_px)
-
-        # 2) If ink exists under the right edge of the box, pull left.
-        int_right_start = max(x2 - local_edge_scan_px, x1)
-        int_right_end = x2
-        right_edge_ink = _leftmost_ink(int_right_start, int_right_end)
-        desired_x2 = x2
-        if right_edge_ink is not None:
-            desired_x2 = right_edge_ink - padding_px
-
-        overlap_present = left_edge_ink is not None or right_edge_ink is not None
-
-        # Avoid collapsing long answer blanks into tiny slivers.
-        effective_min_width = min_width_floor_px
-        effective_min_width = max(effective_min_width, min_width_px)
-        if min_width_ratio > 0 and ref_box_w >= max(min_width_px * 3, 36):
-            effective_min_width = max(effective_min_width, int(ref_box_w * min_width_ratio))
-        effective_min_width = min(effective_min_width, ref_box_w)
-        if effective_min_width < 1:
-            effective_min_width = 1
+        if band_strip.size > 0:
+            binary_band = _binarize_region(band_strip, threshold=threshold, use_adaptive=True)
+        else:
+            binary_band = None
 
         cur_x1, cur_x2 = x1, x2
         cur_y1, cur_y2 = y1, y2
 
-        if not overlap_present and edge_avoid_only:
-            edge_note = "no_overlap"
-            _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note=edge_note)
-        else:
-            # Clamp desired edges to the band and image bounds.
-            desired_x1 = _clamp_int(desired_x1, 0, width - 1)
-            desired_x2 = _clamp_int(desired_x2, 1, width)
+        if binary_band is not None:
+            local_edge_scan = edge_scan_px
+            if local_edge_scan is None or local_edge_scan <= 0:
+                local_edge_scan = _clamp_int(int(orig_w * 0.05), 5, min(80, orig_w))
+            local_edge_scan = max(4, min(local_edge_scan, orig_w))
 
-            def _candidate_from_edges(x1_c: int, x2_c: int) -> tuple[int, int]:
-                x1_c = _clamp_int(x1_c, 0, width - 1)
-                x2_c = _clamp_int(x2_c, 1, width)
-                if x2_c - x1_c >= effective_min_width:
-                    return x1_c, x2_c
-                # Enforce at least the effective minimum width.
-                x2_c = min(width, x1_c + effective_min_width)
-                if x2_c - x1_c < effective_min_width:
-                    x1_c = max(0, x2_c - effective_min_width)
-                return x1_c, x2_c
-
-            # Primary candidate: honor both edge constraints.
-            cand_both = _candidate_from_edges(desired_x1, desired_x2)
-
-            # Fallbacks when constraints conflict: move only one side.
-            cand_right = _candidate_from_edges(desired_x1, desired_x1 + min_width_floor_px)
-            cand_left = _candidate_from_edges(desired_x2 - min_width_floor_px, desired_x2)
-
-            candidates = [cand_both, cand_right, cand_left]
-
-            # Choose the candidate with the least ink under the band; tie-break by
-            # smallest movement from the original box.
-            best = None
-            best_key = None
-            for cand_x1, cand_x2 in candidates:
-                if cand_x2 <= cand_x1:
-                    continue
-                ink = _ink_count(cand_x1, cand_x2)
-                movement = abs(cand_x1 - x1) + abs(cand_x2 - x2)
-                key = (ink, movement)
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best = (cand_x1, cand_x2)
-
-            if best is None:
-                continue
-
-            cur_x1, cur_x2 = best
-            edge_note = (
-                f"left_edge_ink={left_edge_ink} right_edge_ink={right_edge_ink} "
-                f"cand_x1={cur_x1} cand_x2={cur_x2}"
+            new_x1, new_x2, moved, left_ink, right_ink = _edge_avoid(
+                binary_band,
+                band_x1=band_x1,
+                x1=cur_x1,
+                x2=cur_x2,
+                edge_scan_px=local_edge_scan,
+                padding_px=padding_px,
             )
-            _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note=edge_note)
 
-        underline_span: tuple[int, int] | None = None
-        underline_y: int | None = None
-        underline_source: str | None = None
+            effective_min = max(min_width_px, 3)
+            if min_width_ratio > 0 and orig_w >= max(min_width_px * 3, 36):
+                effective_min = max(effective_min, int(orig_w * min_width_ratio))
+            effective_min = min(effective_min, orig_w)
 
-        if snap_left_enabled:
-            # 4) Snap the left edge to the nearest letters on the left using the
-            # current vertical placement (vertical alignment is disabled for now).
-            snap_band = _middle_band(cur_y1, cur_y2)
-            if snap_band is not None:
-                snap_y_top, snap_y_bottom = snap_band
-                snap_start_x = max(0, cur_x1 - search_width_px)
-                snap_end_x = cur_x1
-                if snap_end_x - snap_start_x >= 4:
-                    snap_strip = img[snap_y_top:snap_y_bottom, snap_start_x:snap_end_x]
-                    if snap_strip.size > 0:
-                        _, snap_binary = cv2.threshold(snap_strip, threshold, 255, cv2.THRESH_BINARY_INV)
-                        snap_coords = cv2.findNonZero(snap_binary)
-                        if snap_coords is not None:
-                            last_ink_local_x = int(np.max(snap_coords[:, 0, 0]))
-                            last_ink_x = snap_start_x + last_ink_local_x
-                            snap_x1 = last_ink_x + padding_px
-                            # Keep enough width.
-                            max_snap_x1 = max(0, cur_x2 - min_width_floor_px)
-                            snap_x1 = min(snap_x1, max_snap_x1)
-                            snap_x1 = _clamp_int(snap_x1, 0, width - 1)
-                            if cur_x2 - snap_x1 >= min_width_floor_px:
-                                cur_x1 = snap_x1
-            _record("snap_left", cur_x1, cur_x2, cur_y1, cur_y2)
+            if moved:
+                new_x1 = _clamp_int(new_x1, 0, width - 1)
+                new_x2 = _clamp_int(new_x2, 1, width)
+                if new_x2 - new_x1 < effective_min:
+                    new_x2 = min(width, new_x1 + effective_min)
+                    if new_x2 - new_x1 < effective_min:
+                        new_x1 = max(0, new_x2 - effective_min)
+
+                cur_x1, cur_x2 = new_x1, new_x2
+                _record(
+                    "edge_avoid",
+                    cur_x1,
+                    cur_x2,
+                    cur_y1,
+                    cur_y2,
+                    note=f"left_ink={left_ink} right_ink={right_ink}",
+                )
+            else:
+                _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note="no_overlap")
         else:
-            _record("snap_left", cur_x1, cur_x2, cur_y1, cur_y2, note="disabled")
+            _record("edge_avoid", cur_x1, cur_x2, cur_y1, cur_y2, note="no_band")
 
         if cap_height_enabled:
-            cap_scan_up_px = max(cap_height_min_px, int(orig_box_h * cap_height_scan_up_ratio))
-            cap_scan_down_px = max(2, int(orig_box_h * cap_height_scan_down_ratio))
-            cap_max_height_px = max(cap_height_min_px, int(orig_box_h * cap_height_max_scale))
-            cap_max_shift_px = max(4, int(orig_box_h * cap_height_max_shift_ratio))
-
-            baseline_y = cur_y2
-
-            def _cap_height_from_region(region_x1: int, region_x2: int) -> tuple[int, int] | None:
-                region_width = region_x2 - region_x1
-                if region_width < 6:
-                    return None
-                win_y1 = _clamp_int(int(baseline_y - cap_scan_up_px), 0, height - 1)
-                win_y2 = _clamp_int(int(baseline_y + cap_scan_down_px), 1, height)
-                if win_y2 - win_y1 < cap_height_min_px:
-                    return None
-                strip = img[win_y1:win_y2, region_x1:region_x2]
-                if strip.size == 0:
-                    return None
-                _, binary = cv2.threshold(strip, cap_height_threshold, 255, cv2.THRESH_BINARY_INV)
-                row_counts = np.count_nonzero(binary, axis=1)
-                if row_counts.size == 0:
-                    return None
-                max_ratio = float(row_counts.max() / max(region_width, 1))
-                if max_ratio < cap_height_row_ratio_min:
-                    return None
-                threshold_ratio = max(cap_height_row_ratio_min, max_ratio * cap_height_row_ratio_scale)
-                rows = np.flatnonzero((row_counts / max(region_width, 1)) >= threshold_ratio)
-                if rows.size == 0:
-                    return None
-
-                clusters: list[tuple[int, int]] = []
-                start = int(rows[0])
-                prev = int(rows[0])
-                for idx in rows[1:]:
-                    idx = int(idx)
-                    if idx == prev + 1:
-                        prev = idx
-                        continue
-                    clusters.append((start, prev))
-                    start = prev = idx
-                clusters.append((start, prev))
-
-                baseline_local = int(baseline_y - win_y1)
-                best = None
-                for top, bottom in clusters:
-                    height_px = bottom - top + 1
-                    if height_px < cap_height_min_px:
-                        continue
-                    if height_px > cap_max_height_px:
-                        continue
-                    dist = abs(bottom - baseline_local)
-                    if best is None or dist < best[0]:
-                        best = (dist, top, bottom)
-
-                if best is None:
-                    return None
-                _, top, bottom = best
-                return win_y1 + top, win_y1 + bottom + 1
-
-            cap_region_width = min(search_width_px, max(18, int(orig_box_w * 0.9)))
-            cap_region_width = max(6, int(cap_region_width))
-
-            cap_y = None
-            if cap_region_width > 0:
-                left_x1 = max(0, cur_x1 - cap_region_width)
-                left_x2 = cur_x1
-                cap_y = _cap_height_from_region(left_x1, left_x2)
-
-                if cap_y is None:
-                    right_x1 = cur_x2
-                    right_x2 = min(width, cur_x2 + cap_region_width)
-                    cap_y = _cap_height_from_region(right_x1, right_x2)
-
-            if cap_y is not None:
-                new_y1, new_y2 = cap_y
-                if abs(new_y2 - cur_y2) <= cap_max_shift_px:
-                    cur_y1, cur_y2 = new_y1, new_y2
-                    _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="aligned")
-                else:
-                    _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="skip_shift")
+            cap = _estimate_cap_height(
+                img,
+                x1=cur_x1,
+                y1=cur_y1,
+                x2=cur_x2,
+                y2=cur_y2,
+                search_width_px=search_width_px,
+                threshold=threshold,
+                scan_up_ratio=cap_height_scan_up_ratio,
+                scan_down_ratio=cap_height_scan_down_ratio,
+                row_ratio_min=cap_height_row_ratio_min,
+                row_ratio_scale=cap_height_row_ratio_scale,
+                min_px=cap_height_min_px,
+                max_scale=cap_height_max_scale,
+                max_shift_ratio=cap_height_max_shift_ratio,
+            )
+            if cap is not None:
+                cur_y1, cur_y2 = cap
+                _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="aligned")
             else:
-                _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="no_ink")
+                _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="no_match")
         else:
             _record("cap_height", cur_x1, cur_x2, cur_y1, cur_y2, note="disabled")
-
-        # Underline extension is suspended for now.
-
-        if underline_enabled:
-            # After all horizontal alignment, look for underline/dotted line.
-            margin_x = underline_margin_x_px
-            if margin_x is None or margin_x <= 0:
-                margin_x = max(12, min(search_width_px, 220))
-            margin_x = max(0, int(margin_x))
-
-            def _min_row_pixels(x1_r: int, x2_r: int) -> int:
-                return max(underline_min_row_pixels, int((x2_r - x1_r) * underline_row_ratio_min))
-
-            # Near-bottom scan first (relative to current box).
-            near_x1 = max(0, cur_x1 - margin_x)
-            near_x2 = min(width, cur_x2 + margin_x)
-            near_y1 = cur_y1 + int(orig_box_h * underline_band_top_ratio)
-            near_y2 = min(height, cur_y2 + underline_extra_bottom_px)
-            near_y1 = _clamp_int(near_y1, cur_y1, max(cur_y1, near_y2 - 1))
-            near_y2 = _clamp_int(near_y2, min(height, near_y1 + 1), height)
-
-            near_result = _detect_underline_in_region(
-                img,
-                x1=near_x1,
-                x2=near_x2,
-                y1=near_y1,
-                y2=near_y2,
-                threshold=underline_threshold,
-                coverage_min=underline_line_coverage_min,
-                segments_min=underline_segments_min,
-                gap_cv_max=underline_gap_cv_max,
-                use_otsu=underline_use_otsu,
-                blur_ksize=underline_blur_ksize,
-            )
-
-            if near_result and near_result.get("real_line"):
-                # Enforce a minimum density to avoid letter fragments.
-                analysis = near_result.get("analysis") or {}
-                row_pixels_ok = analysis.get("coverage_ratio", 0.0) >= (
-                    _min_row_pixels(near_x1, near_x2) / max(near_x2 - near_x1, 1)
-                )
-                if row_pixels_ok:
-                    underline_y = int(near_result["underline_y"])
-                    underline_span = near_result.get("span")
-                    underline_source = "near"
-
-            # Underline fragment adjustment is suspended for now.
-
-            # If no underline yet, scan below the box for a real line.
-            below_scan_px = underline_below_scan_px
-            if underline_below_ratio > 0:
-                below_scan_px = max(below_scan_px, int(orig_box_h * underline_below_ratio))
-            # Cap how far below we look for a line (as a fraction of box height).
-            max_below_px = int(orig_box_h * 0.6)
-            if max_below_px > 0:
-                below_scan_px = min(below_scan_px, max_below_px)
-
-            below_candidate: dict | None = None
-            if below_scan_px > 0:
-                below_x1 = max(0, cur_x1 - margin_x)
-                below_x2 = min(width, cur_x2 + margin_x)
-                below_y1 = min(height - 1, cur_y2 + underline_below_margin_top_px)
-                below_y2 = min(height, below_y1 + below_scan_px)
-                below_y1 = _clamp_int(below_y1, 0, max(0, below_y2 - 1))
-                below_y2 = _clamp_int(below_y2, min(height, below_y1 + 1), height)
-
-                below_result = _detect_underline_in_region(
-                    img,
-                    x1=below_x1,
-                    x2=below_x2,
-                    y1=below_y1,
-                    y2=below_y2,
-                    threshold=underline_threshold,
-                    coverage_min=underline_line_coverage_min,
-                    segments_min=underline_segments_min,
-                    gap_cv_max=underline_gap_cv_max,
-                    use_otsu=underline_use_otsu,
-                    blur_ksize=underline_blur_ksize,
-                )
-                if below_result and below_result.get("real_line"):
-                    analysis = below_result.get("analysis") or {}
-                    row_pixels_ok = analysis.get("coverage_ratio", 0.0) >= (
-                        _min_row_pixels(below_x1, below_x2) / max(below_x2 - below_x1, 1)
-                    )
-                    if row_pixels_ok:
-                        candidate_y = int(below_result["underline_y"])
-                        min_pixels = max(3, int(_min_row_pixels(below_x1, below_x2) * 0.5))
-                        thin_ok = _is_thin_line(
-                            img,
-                            x1=below_x1,
-                            x2=below_x2,
-                            y=candidate_y,
-                            threshold=underline_threshold,
-                            min_row_pixels=min_pixels,
-                            max_rows_with_ink=2,
-                            center_ratio=0.55,
-                        )
-                        if thin_ok:
-                            below_candidate = {
-                                "underline_y": candidate_y,
-                                "span": below_result.get("span"),
-                                "score": float((analysis or {}).get("score", 0.0)),
-                            }
-
-            # Choose the more visible candidate between near and below.
-            if underline_y is not None or below_candidate is not None:
-                near_score = -1.0
-                if underline_y is not None and near_result is not None:
-                    near_score = float((near_result.get("analysis") or {}).get("score", 0.0))
-                below_score = float(below_candidate.get("score", -1.0)) if below_candidate else -1.0
-
-                # Prefer the more visible (higher score).
-                if below_score > near_score:
-                    underline_y = int(below_candidate["underline_y"])
-                    underline_span = below_candidate.get("span")
-                    underline_source = "below"
-
-        # Last step: align the box bottom to the detected underline, if any.
-        if underline_y is not None:
-            new_y2 = _clamp_int(underline_y, 1, height)
-            new_y1 = max(0, new_y2 - orig_box_h)
-            cur_y1, cur_y2 = new_y1, new_y2
-            _record(
-                "underline_align",
-                cur_x1,
-                cur_x2,
-                cur_y1,
-                cur_y2,
-                note=f"underline_y={underline_y} span={underline_span} source={underline_source}",
-            )
-        else:
-            _record("underline_align", cur_x1, cur_x2, cur_y1, cur_y2, note="no_underline")
-
-        # Last tweak: expand to underline span without overlapping ink.
-        if underline_span is not None:
-            expand_band = _middle_band(cur_y1, cur_y2)
-            blocked_left = False
-            blocked_right = False
-            if expand_band is not None:
-                exp_y_top, exp_y_bottom = expand_band
-                target_left = max(0, min(int(underline_span[0]), int(cur_x1)))
-                target_right = min(width, max(int(underline_span[1]), int(cur_x2)))
-
-                exp_start = max(0, min(target_left, cur_x1))
-                exp_end = min(width, max(target_right, cur_x2))
-
-                if exp_end - exp_start >= 4 and exp_y_bottom > exp_y_top:
-                    exp_strip = img[exp_y_top:exp_y_bottom, exp_start:exp_end]
-                    if exp_strip.size > 0:
-                        _, exp_binary = cv2.threshold(exp_strip, threshold, 255, cv2.THRESH_BINARY_INV)
-
-                        # Left expansion
-                        if target_left < cur_x1:
-                            rel_start = int(target_left - exp_start)
-                            rel_end = int(cur_x1 - exp_start)
-                            if rel_end - rel_start > 1:
-                                region = exp_binary[:, rel_start:rel_end]
-                                coords = cv2.findNonZero(region)
-                                if coords is None:
-                                    cur_x1 = target_left
-                                else:
-                                    blocked_left = True
-
-                        # Right expansion
-                        if target_right > cur_x2:
-                            rel_start = int(cur_x2 - exp_start)
-                            rel_end = int(target_right - exp_start)
-                            if rel_end - rel_start > 1:
-                                region = exp_binary[:, rel_start:rel_end]
-                                coords = cv2.findNonZero(region)
-                                if coords is None:
-                                    cur_x2 = target_right
-                                else:
-                                    blocked_right = True
-
-            _record(
-                "underline_expand",
-                cur_x1,
-                cur_x2,
-                cur_y1,
-                cur_y2,
-                note=(
-                    f"span={underline_span} blocked_left={blocked_left} "
-                    f"blocked_right={blocked_right}"
-                ),
-            )
-
-        cur_x1 = _clamp_int(cur_x1, 0, width - 1)
-        cur_x2 = _clamp_int(cur_x2, 1, width)
-        if cur_x2 <= cur_x1:
-            continue
-        if cur_x2 - cur_x1 < min_width_floor_px:
-            continue
 
         if cur_x1 == x1 and cur_x2 == x2 and cur_y1 == y1 and cur_y2 == y2:
             _record("final", cur_x1, cur_x2, cur_y1, cur_y2, note="unchanged")

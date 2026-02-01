@@ -130,31 +130,11 @@ CV_SEARCH_WIDTH_PX = int(os.getenv("CV_SEARCH_WIDTH_PX", "220"))
 CV_PADDING_PX = int(os.getenv("CV_PADDING_PX", "6"))
 CV_MIN_WIDTH_PX = int(os.getenv("CV_MIN_WIDTH_PX", "14"))
 CV_MIN_WIDTH_RATIO = float(os.getenv("CV_MIN_WIDTH_RATIO", "0.6"))
-CV_STRIP_HALF_HEIGHT_PX = int(os.getenv("CV_STRIP_HALF_HEIGHT_PX", "6"))
 CV_THRESHOLD = int(os.getenv("CV_THRESHOLD", "200"))
-CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
-CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
+CV_MIDDLE_BAND_RATIO = float(os.getenv("CV_MIDDLE_BAND_RATIO", "0.10"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
 CV_EDGE_SCAN_PX = _cv_edge_scan_raw if _cv_edge_scan_raw > 0 else None
-CV_EDGE_AVOID_ONLY = os.getenv("CV_EDGE_AVOID_ONLY", "1") == "1"
-CV_SNAP_LEFT_ENABLED = os.getenv("CV_SNAP_LEFT_ENABLED", "0") == "1"
 CV_DEBUG = os.getenv("CV_DEBUG", "0") == "1"
-CV_UNDERLINE_ENABLED = os.getenv("CV_UNDERLINE_ENABLED", "1") == "1"
-CV_UNDERLINE_BAND_TOP_RATIO = float(os.getenv("CV_UNDERLINE_BAND_TOP_RATIO", "0.62"))
-CV_UNDERLINE_EXTRA_BOTTOM_PX = int(os.getenv("CV_UNDERLINE_EXTRA_BOTTOM_PX", "10"))
-_cv_underline_margin_raw = int(os.getenv("CV_UNDERLINE_MARGIN_X_PX", "0"))
-CV_UNDERLINE_MARGIN_X_PX = _cv_underline_margin_raw if _cv_underline_margin_raw > 0 else None
-CV_UNDERLINE_ROW_RATIO_MIN = float(os.getenv("CV_UNDERLINE_ROW_RATIO_MIN", "0.02"))
-CV_UNDERLINE_MIN_ROW_PIXELS = int(os.getenv("CV_UNDERLINE_MIN_ROW_PIXELS", "12"))
-CV_UNDERLINE_LINE_COVERAGE_MIN = float(os.getenv("CV_UNDERLINE_LINE_COVERAGE_MIN", "0.16"))
-CV_UNDERLINE_SEGMENTS_MIN = int(os.getenv("CV_UNDERLINE_SEGMENTS_MIN", "3"))
-CV_UNDERLINE_GAP_CV_MAX = float(os.getenv("CV_UNDERLINE_GAP_CV_MAX", "1.4"))
-CV_UNDERLINE_BELOW_SCAN_PX = int(os.getenv("CV_UNDERLINE_BELOW_SCAN_PX", "28"))
-CV_UNDERLINE_BELOW_MARGIN_TOP_PX = int(os.getenv("CV_UNDERLINE_BELOW_MARGIN_TOP_PX", "2"))
-CV_UNDERLINE_BELOW_RATIO = float(os.getenv("CV_UNDERLINE_BELOW_RATIO", "0.5"))
-CV_UNDERLINE_USE_OTSU = os.getenv("CV_UNDERLINE_USE_OTSU", "1") == "1"
-CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
-CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
 CV_CAP_HEIGHT_ENABLED = os.getenv("CV_CAP_HEIGHT_ENABLED", "1") == "1"
 CV_CAP_HEIGHT_SCAN_UP_RATIO = float(os.getenv("CV_CAP_HEIGHT_SCAN_UP_RATIO", "2.2"))
 CV_CAP_HEIGHT_SCAN_DOWN_RATIO = float(os.getenv("CV_CAP_HEIGHT_SCAN_DOWN_RATIO", "0.6"))
@@ -163,8 +143,6 @@ CV_CAP_HEIGHT_ROW_RATIO_SCALE = float(os.getenv("CV_CAP_HEIGHT_ROW_RATIO_SCALE",
 CV_CAP_HEIGHT_MIN_PX = int(os.getenv("CV_CAP_HEIGHT_MIN_PX", "6"))
 CV_CAP_HEIGHT_MAX_SCALE = float(os.getenv("CV_CAP_HEIGHT_MAX_SCALE", "2.2"))
 CV_CAP_HEIGHT_MAX_SHIFT_RATIO = float(os.getenv("CV_CAP_HEIGHT_MAX_SHIFT_RATIO", "1.2"))
-_cv_cap_height_threshold_raw = int(os.getenv("CV_CAP_HEIGHT_THRESHOLD", "0"))
-CV_CAP_HEIGHT_THRESHOLD = _cv_cap_height_threshold_raw if _cv_cap_height_threshold_raw > 0 else None
 
 PROMPT_TEMPLATE = """
 Identify all user-fillable blanks (underlines/dotted/dashed lines, empty boxes, long empty spaces) on the page.
@@ -1788,28 +1766,9 @@ def process_page(
                         padding_px=CV_PADDING_PX,
                         min_width_px=CV_MIN_WIDTH_PX,
                         min_width_ratio=CV_MIN_WIDTH_RATIO,
-                        strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
-                        scan_top_ratio=CV_SCAN_TOP_RATIO,
-                        scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
-                        edge_avoid_only=CV_EDGE_AVOID_ONLY,
-                        snap_left_enabled=CV_SNAP_LEFT_ENABLED,
-                        underline_enabled=False,
-                        underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
-                        underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
-                        underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
-                        underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
-                        underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
-                        underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
-                        underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
-                        underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
-                        underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
-                        underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
-                        underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
-                        underline_use_otsu=CV_UNDERLINE_USE_OTSU,
-                        underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
-                        underline_threshold=CV_UNDERLINE_THRESHOLD,
+                        middle_band_ratio=CV_MIDDLE_BAND_RATIO,
                         cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
                         cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
                         cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
@@ -1818,7 +1777,6 @@ def process_page(
                         cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
                         cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
                         cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
-                        cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="pre_filter",
                     )
@@ -1834,28 +1792,9 @@ def process_page(
                         padding_px=CV_PADDING_PX,
                         min_width_px=CV_MIN_WIDTH_PX,
                         min_width_ratio=CV_MIN_WIDTH_RATIO,
-                        strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                         threshold=CV_THRESHOLD,
-                        scan_top_ratio=CV_SCAN_TOP_RATIO,
-                        scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
-                        edge_avoid_only=CV_EDGE_AVOID_ONLY,
-                        snap_left_enabled=CV_SNAP_LEFT_ENABLED,
-                        underline_enabled=False,
-                        underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
-                        underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
-                        underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
-                        underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
-                        underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
-                        underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
-                        underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
-                        underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
-                        underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
-                        underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
-                        underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
-                        underline_use_otsu=CV_UNDERLINE_USE_OTSU,
-                        underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
-                        underline_threshold=CV_UNDERLINE_THRESHOLD,
+                        middle_band_ratio=CV_MIDDLE_BAND_RATIO,
                         cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
                         cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
                         cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
@@ -1864,7 +1803,6 @@ def process_page(
                         cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
                         cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
                         cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
-                        cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="post_align",
                     )
@@ -2150,28 +2088,9 @@ def redo_cv(job_id: str):
                     padding_px=CV_PADDING_PX,
                     min_width_px=CV_MIN_WIDTH_PX,
                     min_width_ratio=CV_MIN_WIDTH_RATIO,
-                    strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                     threshold=CV_THRESHOLD,
-                    scan_top_ratio=CV_SCAN_TOP_RATIO,
-                    scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     edge_scan_px=CV_EDGE_SCAN_PX,
-                    edge_avoid_only=CV_EDGE_AVOID_ONLY,
-                    snap_left_enabled=CV_SNAP_LEFT_ENABLED,
-                    underline_enabled=False,
-                    underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
-                    underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
-                    underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
-                    underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
-                    underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
-                    underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
-                    underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
-                    underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
-                    underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
-                    underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
-                    underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
-                    underline_use_otsu=CV_UNDERLINE_USE_OTSU,
-                    underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
-                    underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    middle_band_ratio=CV_MIDDLE_BAND_RATIO,
                     cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
                     cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
                     cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
@@ -2180,7 +2099,6 @@ def redo_cv(job_id: str):
                     cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
                     cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
                     cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
-                    cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                     debug=cv_debug,
                     debug_pass_name="pre_filter",
                 )
@@ -2191,28 +2109,9 @@ def redo_cv(job_id: str):
                     padding_px=CV_PADDING_PX,
                     min_width_px=CV_MIN_WIDTH_PX,
                     min_width_ratio=CV_MIN_WIDTH_RATIO,
-                    strip_half_height_px=CV_STRIP_HALF_HEIGHT_PX,
                     threshold=CV_THRESHOLD,
-                    scan_top_ratio=CV_SCAN_TOP_RATIO,
-                    scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     edge_scan_px=CV_EDGE_SCAN_PX,
-                    edge_avoid_only=CV_EDGE_AVOID_ONLY,
-                    snap_left_enabled=CV_SNAP_LEFT_ENABLED,
-                    underline_enabled=False,
-                    underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
-                    underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
-                    underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
-                    underline_row_ratio_min=CV_UNDERLINE_ROW_RATIO_MIN,
-                    underline_min_row_pixels=CV_UNDERLINE_MIN_ROW_PIXELS,
-                    underline_line_coverage_min=CV_UNDERLINE_LINE_COVERAGE_MIN,
-                    underline_segments_min=CV_UNDERLINE_SEGMENTS_MIN,
-                    underline_gap_cv_max=CV_UNDERLINE_GAP_CV_MAX,
-                    underline_below_scan_px=CV_UNDERLINE_BELOW_SCAN_PX,
-                    underline_below_margin_top_px=CV_UNDERLINE_BELOW_MARGIN_TOP_PX,
-                    underline_below_ratio=CV_UNDERLINE_BELOW_RATIO,
-                    underline_use_otsu=CV_UNDERLINE_USE_OTSU,
-                    underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
-                    underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    middle_band_ratio=CV_MIDDLE_BAND_RATIO,
                     cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
                     cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
                     cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
@@ -2221,7 +2120,6 @@ def redo_cv(job_id: str):
                     cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
                     cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
                     cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
-                    cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                     debug=cv_debug,
                     debug_pass_name="post_align",
                 )
