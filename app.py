@@ -136,6 +136,8 @@ CV_SCAN_TOP_RATIO = float(os.getenv("CV_SCAN_TOP_RATIO", "0.30"))
 CV_SCAN_BOTTOM_RATIO = float(os.getenv("CV_SCAN_BOTTOM_RATIO", "0.70"))
 _cv_edge_scan_raw = int(os.getenv("CV_EDGE_SCAN_PX", "0"))
 CV_EDGE_SCAN_PX = _cv_edge_scan_raw if _cv_edge_scan_raw > 0 else None
+CV_EDGE_AVOID_ONLY = os.getenv("CV_EDGE_AVOID_ONLY", "1") == "1"
+CV_SNAP_LEFT_ENABLED = os.getenv("CV_SNAP_LEFT_ENABLED", "0") == "1"
 CV_DEBUG = os.getenv("CV_DEBUG", "0") == "1"
 CV_UNDERLINE_ENABLED = os.getenv("CV_UNDERLINE_ENABLED", "1") == "1"
 CV_UNDERLINE_BAND_TOP_RATIO = float(os.getenv("CV_UNDERLINE_BAND_TOP_RATIO", "0.62"))
@@ -153,27 +155,34 @@ CV_UNDERLINE_BELOW_RATIO = float(os.getenv("CV_UNDERLINE_BELOW_RATIO", "0.5"))
 CV_UNDERLINE_USE_OTSU = os.getenv("CV_UNDERLINE_USE_OTSU", "1") == "1"
 CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
 CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
+CV_CAP_HEIGHT_ENABLED = os.getenv("CV_CAP_HEIGHT_ENABLED", "1") == "1"
+CV_CAP_HEIGHT_SCAN_UP_RATIO = float(os.getenv("CV_CAP_HEIGHT_SCAN_UP_RATIO", "2.2"))
+CV_CAP_HEIGHT_SCAN_DOWN_RATIO = float(os.getenv("CV_CAP_HEIGHT_SCAN_DOWN_RATIO", "0.6"))
+CV_CAP_HEIGHT_ROW_RATIO_MIN = float(os.getenv("CV_CAP_HEIGHT_ROW_RATIO_MIN", "0.03"))
+CV_CAP_HEIGHT_ROW_RATIO_SCALE = float(os.getenv("CV_CAP_HEIGHT_ROW_RATIO_SCALE", "0.45"))
+CV_CAP_HEIGHT_MIN_PX = int(os.getenv("CV_CAP_HEIGHT_MIN_PX", "6"))
+CV_CAP_HEIGHT_MAX_SCALE = float(os.getenv("CV_CAP_HEIGHT_MAX_SCALE", "2.2"))
+CV_CAP_HEIGHT_MAX_SHIFT_RATIO = float(os.getenv("CV_CAP_HEIGHT_MAX_SHIFT_RATIO", "1.2"))
+_cv_cap_height_threshold_raw = int(os.getenv("CV_CAP_HEIGHT_THRESHOLD", "0"))
+CV_CAP_HEIGHT_THRESHOLD = _cv_cap_height_threshold_raw if _cv_cap_height_threshold_raw > 0 else None
 
 PROMPT_TEMPLATE = """
-Identify all user-fillable blanks (underlines/dotted/dashed lines, empty boxes, long empty spaces). Return strict JSON:
-{"items":[{"target_box":[ymin,xmin,ymax,xmax],"answer":"string","filled":false}]}
+Identify all user-fillable blanks (underlines/dotted/dashed lines, empty boxes, long empty spaces) on the page.
+For each blank, determine the correct answer from the visible question, instructions, or word bank.
+If the correct answer is not explicitly deducible, leave the answer empty (do not guess).
 
 Coords: [ymin,xmin,ymax,xmax], relative to image, scale 0-1000 ints.
 
 Rules:
-- Identify every type of exercis.
-- Exercise which require writing, must be checkes super tightly.
-- answer must be the correct text to fill in that blank. If unclear, use an empty string.
+- Identify every type of exercise that requires writing.
 - target_box tightly bounds the blank only; ymax aligns to text baseline; height ~ cap height.
-- filled=true if handwriting/typed text present.
+- filled=true if handwriting/typed text is already present.
 - Boxes must not overlap; split touching blanks.
 - When there are multiple lines one under another, but the box only on the topmost line.
-- Include every intended blank, even short/faint/uncertain ones. 
-- IMPORTANT: do not place even an edge of textboxes over any existing text!!! 
+- Include every intended blank, even short/faint/uncertain ones.
+- IMPORTANT: do not place even an edge of textboxes over any existing text.
 - IMPORTANT: one line can have multiple blanks, don't miss or merge them.
-- No extra output outside JSON.  
-- If none: {"items":[]}
-- Output ONLY the JSON object (no prose/markdown).
+- Output must match the response schema exactly, with no extra text or formatting.
 """.strip()
 
 RESPONSE_SCHEMA = {
@@ -182,6 +191,7 @@ RESPONSE_SCHEMA = {
     "properties": {
         "items": {
             "type": "array",
+            "description": "All detected user-fillable blanks on the page.",
             "items": {
                 "type": "object",
                 "properties": {
@@ -196,7 +206,7 @@ RESPONSE_SCHEMA = {
                     "answer": {"type": "string", "description": "Correct fill-in answer text."},
                     "filled": {"type": "boolean", "description": "True if the blank is already filled."},
                 },
-                "required": ["target_box"],
+                "required": ["target_box", "answer"],
             },
         },
         # Backward-compatible path if the model still returns boxes.
@@ -1013,10 +1023,12 @@ def build_safety_settings():
     return settings or None
 
 
-def build_tools():
+def build_tools(model_name: str | None = None, structured_output: bool = False):
     if not GEMINI_CODE_EXECUTION:
         return None
     if types is None or not hasattr(types, "Tool"):
+        return None
+    if structured_output and model_name and not is_gemini_3_model(model_name):
         return None
 
     tool = None
@@ -1045,14 +1057,17 @@ def build_generation_config(model_name: str | None = None):
         "top_p": GEMINI_TOP_P,
         "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
         "response_mime_type": "application/json",
-        "response_schema": RESPONSE_SCHEMA,
     }
+    if isinstance(RESPONSE_SCHEMA, dict):
+        config_kwargs["response_json_schema"] = RESPONSE_SCHEMA
+    else:
+        config_kwargs["response_schema"] = RESPONSE_SCHEMA
 
     safety_settings = build_safety_settings()
     if safety_settings:
         config_kwargs["safety_settings"] = safety_settings
 
-    tools = build_tools()
+    tools = build_tools(model_name=model_name, structured_output=True)
     if tools:
         config_kwargs["tools"] = tools
 
@@ -1778,7 +1793,9 @@ def process_page(
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
                         scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
-                        underline_enabled=CV_UNDERLINE_ENABLED,
+                        edge_avoid_only=CV_EDGE_AVOID_ONLY,
+                        snap_left_enabled=CV_SNAP_LEFT_ENABLED,
+                        underline_enabled=False,
                         underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
                         underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
                         underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
@@ -1793,6 +1810,15 @@ def process_page(
                         underline_use_otsu=CV_UNDERLINE_USE_OTSU,
                         underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
                         underline_threshold=CV_UNDERLINE_THRESHOLD,
+                        cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
+                        cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
+                        cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
+                        cap_height_row_ratio_min=CV_CAP_HEIGHT_ROW_RATIO_MIN,
+                        cap_height_row_ratio_scale=CV_CAP_HEIGHT_ROW_RATIO_SCALE,
+                        cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
+                        cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
+                        cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
+                        cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="pre_filter",
                     )
@@ -1813,7 +1839,9 @@ def process_page(
                         scan_top_ratio=CV_SCAN_TOP_RATIO,
                         scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                         edge_scan_px=CV_EDGE_SCAN_PX,
-                        underline_enabled=CV_UNDERLINE_ENABLED,
+                        edge_avoid_only=CV_EDGE_AVOID_ONLY,
+                        snap_left_enabled=CV_SNAP_LEFT_ENABLED,
+                        underline_enabled=False,
                         underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
                         underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
                         underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
@@ -1828,6 +1856,15 @@ def process_page(
                         underline_use_otsu=CV_UNDERLINE_USE_OTSU,
                         underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
                         underline_threshold=CV_UNDERLINE_THRESHOLD,
+                        cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
+                        cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
+                        cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
+                        cap_height_row_ratio_min=CV_CAP_HEIGHT_ROW_RATIO_MIN,
+                        cap_height_row_ratio_scale=CV_CAP_HEIGHT_ROW_RATIO_SCALE,
+                        cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
+                        cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
+                        cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
+                        cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                         debug=cv_debug,
                         debug_pass_name="post_align",
                     )
@@ -2118,7 +2155,9 @@ def redo_cv(job_id: str):
                     scan_top_ratio=CV_SCAN_TOP_RATIO,
                     scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     edge_scan_px=CV_EDGE_SCAN_PX,
-                    underline_enabled=CV_UNDERLINE_ENABLED,
+                    edge_avoid_only=CV_EDGE_AVOID_ONLY,
+                    snap_left_enabled=CV_SNAP_LEFT_ENABLED,
+                    underline_enabled=False,
                     underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
                     underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
                     underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
@@ -2133,6 +2172,15 @@ def redo_cv(job_id: str):
                     underline_use_otsu=CV_UNDERLINE_USE_OTSU,
                     underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
                     underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
+                    cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
+                    cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
+                    cap_height_row_ratio_min=CV_CAP_HEIGHT_ROW_RATIO_MIN,
+                    cap_height_row_ratio_scale=CV_CAP_HEIGHT_ROW_RATIO_SCALE,
+                    cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
+                    cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
+                    cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
+                    cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                     debug=cv_debug,
                     debug_pass_name="pre_filter",
                 )
@@ -2148,7 +2196,9 @@ def redo_cv(job_id: str):
                     scan_top_ratio=CV_SCAN_TOP_RATIO,
                     scan_bottom_ratio=CV_SCAN_BOTTOM_RATIO,
                     edge_scan_px=CV_EDGE_SCAN_PX,
-                    underline_enabled=CV_UNDERLINE_ENABLED,
+                    edge_avoid_only=CV_EDGE_AVOID_ONLY,
+                    snap_left_enabled=CV_SNAP_LEFT_ENABLED,
+                    underline_enabled=False,
                     underline_band_top_ratio=CV_UNDERLINE_BAND_TOP_RATIO,
                     underline_extra_bottom_px=CV_UNDERLINE_EXTRA_BOTTOM_PX,
                     underline_margin_x_px=CV_UNDERLINE_MARGIN_X_PX,
@@ -2163,6 +2213,15 @@ def redo_cv(job_id: str):
                     underline_use_otsu=CV_UNDERLINE_USE_OTSU,
                     underline_blur_ksize=CV_UNDERLINE_BLUR_KSIZE,
                     underline_threshold=CV_UNDERLINE_THRESHOLD,
+                    cap_height_enabled=CV_CAP_HEIGHT_ENABLED,
+                    cap_height_scan_up_ratio=CV_CAP_HEIGHT_SCAN_UP_RATIO,
+                    cap_height_scan_down_ratio=CV_CAP_HEIGHT_SCAN_DOWN_RATIO,
+                    cap_height_row_ratio_min=CV_CAP_HEIGHT_ROW_RATIO_MIN,
+                    cap_height_row_ratio_scale=CV_CAP_HEIGHT_ROW_RATIO_SCALE,
+                    cap_height_min_px=CV_CAP_HEIGHT_MIN_PX,
+                    cap_height_max_scale=CV_CAP_HEIGHT_MAX_SCALE,
+                    cap_height_max_shift_ratio=CV_CAP_HEIGHT_MAX_SHIFT_RATIO,
+                    cap_height_threshold=CV_CAP_HEIGHT_THRESHOLD,
                     debug=cv_debug,
                     debug_pass_name="post_align",
                 )
