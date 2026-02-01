@@ -52,6 +52,7 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.1"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
 GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().lower()
 GEMINI_CODE_EXECUTION = os.getenv("GEMINI_CODE_EXECUTION", "1") == "1"
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
@@ -154,35 +155,25 @@ CV_UNDERLINE_BLUR_KSIZE = int(os.getenv("CV_UNDERLINE_BLUR_KSIZE", "3"))
 CV_UNDERLINE_THRESHOLD = int(os.getenv("CV_UNDERLINE_THRESHOLD", "140"))
 
 PROMPT_TEMPLATE = """
-Task: Identify all user-fillable blanks (underlines, dotted/dashed lines, empty boxes, or long empty spaces meant for input) in the document. Return their bounding boxes in strict JSON format.
+Identify all user-fillable blanks (underlines/dotted/dashed lines, empty boxes, long empty spaces). Return strict JSON:
+{"items":[{"target_box":[ymin,xmin,ymax,xmax],"answer":"string","filled":false}]}
 
-Coordinate System:
-- Use [ymin, xmin, ymax, xmax] relative to the image dimensions.
-- Scale: 0-1000 (integer values).
-
-Return JSON format:
-{"items": [{"target_box": [ymin, xmin, ymax, xmax], "label": "string", "filled": false}]}
+Coords: [ymin,xmin,ymax,xmax], relative to image, scale 0-1000 ints.
 
 Rules:
-- The target_box must tightly bound only the writable blank area.
-- The bottom edge (ymax) of the target_box should align with the text baseline on that line.
-- Use tight heights that match the cap height of the surrounding text.
-- Include filled: true when the blank already contains handwriting or typed text.
-- Double check coordinates for accuracy.
-- Double check that all boxes are on lines, dotted lines, underlines, dashed lines, or empty spaces meant for user input.
-- Boxes must not overlap. If two blanks touch, split them into separate boxes.
-- If no blanks are found, return {"items": []}.
-
-Coverage rules (do not miss blanks):
-- Find every blank intended for user input: underlines, dotted/dashed lines, empty boxes, or long empty spaces between printed text.
-- Treat each contiguous blank segment as its own target_box (do not merge blanks separated by text).
-- Include short blanks (1–2 words) and long blanks, including those after parentheses or before punctuation.
-- Do not skip faint, thin, or partially obscured lines.
-- If uncertain whether a blank is intended for input, include it.
-
-Output rules (strict):
-- Return ONLY the JSON object. No prose, no markdown, no code fences.
-- The entire response must be a single JSON object that matches the schema.
+- Identify every type of exercis.
+- Exercise which require writing, must be checkes super tightly.
+- answer must be the correct text to fill in that blank. If unclear, use an empty string.
+- target_box tightly bounds the blank only; ymax aligns to text baseline; height ~ cap height.
+- filled=true if handwriting/typed text present.
+- Boxes must not overlap; split touching blanks.
+- When there are multiple lines one under another, but the box only on the topmost line.
+- Include every intended blank, even short/faint/uncertain ones. 
+- IMPORTANT: do not place even an edge of textboxes over any existing text!!! 
+- IMPORTANT: one line can have multiple blanks, don't miss or merge them.
+- No extra output outside JSON.  
+- If none: {"items":[]}
+- Output ONLY the JSON object (no prose/markdown).
 """.strip()
 
 RESPONSE_SCHEMA = {
@@ -202,6 +193,7 @@ RESPONSE_SCHEMA = {
                         "description": "Target blank box [ymin, xmin, ymax, xmax] on a 0-1000 scale.",
                     },
                     "label": {"type": "string"},
+                    "answer": {"type": "string", "description": "Correct fill-in answer text."},
                     "filled": {"type": "boolean", "description": "True if the blank is already filled."},
                 },
                 "required": ["target_box"],
@@ -226,6 +218,7 @@ RESPONSE_SCHEMA = {
                         "maxItems": 4,
                     },
                     "label": {"type": "string"},
+                    "answer": {"type": "string"},
                     "filled": {"type": "boolean"},
                 },
             },
@@ -970,6 +963,19 @@ def extract_text_candidates(response) -> list[str]:
     if texts:
         return texts
 
+    parsed = get_attr_or_key(response, "parsed")
+    if parsed is not None:
+        try:
+            if hasattr(parsed, "model_dump"):
+                parsed = parsed.model_dump()
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            try:
+                return [json.dumps(parsed)]
+            except Exception:
+                return [str(parsed)]
+
     try:
         fallback = response.text
     except Exception:
@@ -1027,7 +1033,13 @@ def build_tools():
     return [tool]
 
 
-def build_generation_config():
+def is_gemini_3_model(model_name: str | None) -> bool:
+    name = str(model_name or "").strip().lower()
+    return name.startswith("gemini-3")
+
+
+def build_generation_config(model_name: str | None = None):
+    model_name = model_name or GEMINI_MODEL
     config_kwargs = {
         "temperature": GEMINI_TEMPERATURE,
         "top_p": GEMINI_TOP_P,
@@ -1044,11 +1056,20 @@ def build_generation_config():
     if tools:
         config_kwargs["tools"] = tools
 
-    if GEMINI_THINKING_BUDGET >= 0 and types is not None and hasattr(types, "ThinkingConfig"):
-        try:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
-        except Exception:
-            pass
+    if types is not None and hasattr(types, "ThinkingConfig"):
+        thinking_config = None
+        if GEMINI_THINKING_LEVEL and is_gemini_3_model(model_name):
+            try:
+                thinking_config = types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL)
+            except Exception:
+                thinking_config = None
+        if thinking_config is None and GEMINI_THINKING_BUDGET >= 0:
+            try:
+                thinking_config = types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
+            except Exception:
+                thinking_config = None
+        if thinking_config is not None:
+            config_kwargs["thinking_config"] = thinking_config
 
     try:
         return types.GenerateContentConfig(**config_kwargs)
@@ -1056,12 +1077,19 @@ def build_generation_config():
         return config_kwargs
 
 
-def call_gemini_with_retries(client, contents, config):
+def call_gemini_with_retries(client, contents, config=None):
     attempts = max(GEMINI_MAX_RETRIES, 0) + 1
     last_exc = None
+    primary_config = config or build_generation_config(GEMINI_MODEL)
     for attempt in range(attempts):
+        logger.info(
+            "Gemini request attempt %s/%s (model=%s)",
+            attempt + 1,
+            attempts,
+            GEMINI_MODEL,
+        )
         try:
-            return client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+            return client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=primary_config)
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts - 1:
@@ -1077,9 +1105,20 @@ def call_gemini_with_retries(client, contents, config):
             time.sleep(backoff)
 
     if GEMINI_FALLBACK_MODEL:
+        fallback_config = build_generation_config(GEMINI_FALLBACK_MODEL)
         for attempt in range(attempts):
+            logger.info(
+                "Gemini fallback attempt %s/%s (model=%s)",
+                attempt + 1,
+                attempts,
+                GEMINI_FALLBACK_MODEL,
+            )
             try:
-                return client.models.generate_content(model=GEMINI_FALLBACK_MODEL, contents=contents, config=config)
+                return client.models.generate_content(
+                    model=GEMINI_FALLBACK_MODEL,
+                    contents=contents,
+                    config=fallback_config,
+                )
             except Exception as exc:
                 last_exc = exc
                 if attempt >= attempts - 1:
@@ -1191,6 +1230,14 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         if box_type not in {"answer", "exercise"}:
             box_type = "answer"
         label = str(raw.get("label", "")).strip()[:80]
+        answer_raw = raw.get("answer")
+        if answer_raw is None:
+            answer_raw = raw.get("label")
+        answer = str(answer_raw or "").strip()
+        if len(answer) > 160:
+            answer = answer[:160]
+        if box_type != "answer":
+            answer = ""
 
         if box_type == "answer":
             x, y, w, h = inset_box(x, y, w, h, BOX_INSET_RATIO)
@@ -1206,6 +1253,7 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
                 "w": w,
                 "h": h,
                 "label": label,
+                "answer": answer,
                 "anchor": "",
             }
         )

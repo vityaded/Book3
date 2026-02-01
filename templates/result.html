@@ -23,6 +23,12 @@
         </div>
       </section>
 
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <div class="flash">{{ messages[0] }}</div>
+        {% endif %}
+      {% endwith %}
+
       {% for page in job.pages %}
         {% set show_ocr = debug_ocr and page.ocr_words %}
         {% set cv_debug_enabled = debug_cv and (page.cv_debug_step_count or 0) > 0 %}
@@ -90,6 +96,7 @@
                     class="answer-wrap"
                     style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
                     data-box-id="{{ box.id }}"
+                    data-answer="{{ box.answer or box.label or '' }}"
                     {% if cv_steps %}
                       data-cv-debug="1"
                       data-cv-debug-steps='{{ cv_steps | tojson }}'
@@ -217,5 +224,6 @@
         });
       </script>
     {% endif %}
+    <script src="{{ url_for('static', filename='js/result.js') }}"></script>
   </body>
 </html>

@@ -48,6 +48,23 @@ main {
   margin: 0 0 12px;
 }
 
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--sea-soft);
+  color: var(--sea);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.badge.debug {
+  background: rgba(208, 115, 36, 0.18);
+  color: var(--accent-deep);
+}
+
 .hero p {
   margin: 0;
   font-size: 1.05rem;
@@ -78,28 +95,82 @@ main {
   accent-color: var(--sea);
 }
 
-.hero .badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  background: var(--sea-soft);
-  color: var(--sea);
-  font-weight: 600;
-  font-size: 0.85rem;
-}
-
 .hero .badge.debug {
   margin-left: 8px;
-  background: rgba(208, 115, 36, 0.18);
-  color: var(--accent-deep);
 }
 
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 20px;
+}
+
+.jobs {
+  margin-top: 32px;
+}
+
+.jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.jobs-header h2 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.job-list {
+  display: grid;
+  gap: 14px;
+}
+
+.job-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid var(--stroke);
+  box-shadow: 0 12px 26px var(--shadow);
+  animation: rise 0.6s ease both;
+}
+
+.job-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.job-sub {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: rgba(27, 29, 26, 0.7);
+  font-size: 0.95rem;
+}
+
+.job-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.job-actions form {
+  margin: 0;
 }
 
 .card {
@@ -408,6 +479,18 @@ main {
   box-shadow: 0 0 0 3px rgba(208, 115, 36, 0.2);
 }
 
+.answer-wrap.answer-correct .answer-input {
+  border-color: rgba(46, 204, 113, 0.95);
+  box-shadow: 0 0 0 3px rgba(46, 204, 113, 0.22);
+  background: rgba(46, 204, 113, 0.18);
+}
+
+.answer-wrap.answer-wrong .answer-input {
+  border-color: rgba(176, 58, 46, 0.95);
+  box-shadow: 0 0 0 3px rgba(176, 58, 46, 0.2);
+  background: rgba(176, 58, 46, 0.16);
+}
+
 .exercise-box {
   position: absolute;
   border: 2px dashed rgba(208, 115, 36, 0.55);
@@ -451,5 +534,14 @@ main {
   .page-header {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .job-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .job-actions {
+    width: 100%;
   }
 }
