@@ -145,75 +145,66 @@ CV_CAP_HEIGHT_MAX_SCALE = float(os.getenv("CV_CAP_HEIGHT_MAX_SCALE", "2.2"))
 CV_CAP_HEIGHT_MAX_SHIFT_RATIO = float(os.getenv("CV_CAP_HEIGHT_MAX_SHIFT_RATIO", "1.2"))
 
 PROMPT_TEMPLATE = """
-Identify all user-fillable blanks (underlines/dotted/dashed lines, empty boxes, long empty spaces) on the page.
-For each blank, determine the correct answer from the visible question, instructions, or word bank.
-If the correct answer is not explicitly deducible, leave the answer empty (do not guess).
+You are a Document Layout Analysis Engine. Your goal is to detect every user-fillable input field in the provided document image with pixel-perfect precision.
 
-Coords: [ymin,xmin,ymax,xmax], relative to image, scale 0-1000 ints.
+COORDINATE SYSTEM
+- Return 2D bounding boxes in normalized coordinates [ymin, xmin, ymax, xmax] relative to the image size.
+- Scale: 0-1000 (where 0 is top/left and 1000 is bottom/right).
 
-Rules:
-- Identify every type of exercise that requires writing.
-- target_box tightly bounds the blank only; ymax aligns to text baseline; height ~ cap height.
-- filled=true if handwriting/typed text is already present.
-- Boxes must not overlap; split touching blanks.
-- When there are multiple lines one under another, but the box only on the topmost line.
-- Include every intended blank, even short/faint/uncertain ones.
-- IMPORTANT: do not place even an edge of textboxes over any existing text.
-- IMPORTANT: one line can have multiple blanks, don't miss or merge them.
-- Output must match the response schema exactly, with no extra text or formatting.
+DETECTION RULES (STRICT)
+
+1. TARGET DEFINITION:
+   - Identify visual features intended for user input: underlines (____), empty boxes ([ ]), or logical gaps in text (cloze deletions like "h__r").
+   - Ignore purely decorative lines.
+
+2. VERTICAL ALIGNMENT (CRITICAL):
+   - The bottom edge (ymax) of your bounding box must align exactly with the visual baseline of the text line.
+   - Do NOT let the box "float" above the line.
+   - The height of the box should match the surrounding text's font size (approx. 120% of the character height) to encompass ascenders and descenders.
+
+3. HORIZONTAL MERGING:
+   - Context: Hand-made forms often use broken lines (e.g., "_ _ _ _") to indicate a single long answer.
+   - Rule: If multiple underline segments or small gaps appear consecutively on the same line with no printed text between them, MERGE them into a single bounding box. Do not output fragmented boxes for a single answer field.
+
+4. HANDWRITING HANDLING:
+   - If a field contains handwriting:
+     - Set "filled": true.
+     - Bounding Logic: Your box should primarily bound the intended field area (the underline/box), NOT the messy handwriting strokes that might extend wildly up or down. Capture the logical space.
+
+5. WORD COMPLETION (CLOZE) SPECIFIC:
+   - For gaps inside words (e.g., "w__st"), the box must span from the last printed letter's edge to the next printed letter's edge.
+   - Constraint: It is acceptable for the box edges to touch the bounding box of adjacent printed letters (pixel-tight), but do not obscure the printed letter itself.
+
+OUTPUT SCHEMA (JSON ONLY)
+Respond with a raw JSON array. Do not include markdown formatting or explanations.
+
+[
+  {
+    "box_2d": [ymin, xmin, ymax, xmax],
+    "text_content": "The readable answer string inside the box (if filled) or inferred answer from context (if empty). Leave null if undeducible.",
+    "filled": boolean,
+    "type": "underline" | "box" | "cloze_gap"
+  }
+]
 """.strip()
 
 RESPONSE_SCHEMA = {
-
-    "type": "object",
-    "properties": {
-        "items": {
-            "type": "array",
-            "description": "All detected user-fillable blanks on the page.",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "target_box": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                        "description": "Target blank box [ymin, xmin, ymax, xmax] on a 0-1000 scale.",
-                    },
-                    "label": {"type": "string"},
-                    "answer": {"type": "string", "description": "Correct fill-in answer text."},
-                    "filled": {"type": "boolean", "description": "True if the blank is already filled."},
-                },
-                "required": ["target_box", "answer"],
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "box_2d": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 4,
+                "maxItems": 4,
             },
+            "text_content": {"type": ["string", "null"]},
+            "filled": {"type": "boolean"},
+            "type": {"type": "string", "enum": ["underline", "box", "cloze_gap"]},
         },
-        # Backward-compatible path if the model still returns boxes.
-        "boxes": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "box_2d": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                    },
-                    "bbox": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "minItems": 4,
-                        "maxItems": 4,
-                    },
-                    "label": {"type": "string"},
-                    "answer": {"type": "string"},
-                    "filled": {"type": "boolean"},
-                },
-            },
-        },
-        "coord_scale": {"type": "number"},
+        "required": ["box_2d", "filled", "type"],
     },
-    "required": ["items"],
 }
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -449,7 +440,7 @@ def select_ocr_words_for_debug(ocr_words: list[dict], boxes: list[dict]) -> list
     if not boxes:
         return ocr_words
 
-    answer_boxes = [box for box in boxes if box.get("type") == "answer"]
+    answer_boxes = [box for box in boxes if is_answer_type(box.get("type"))]
     if not answer_boxes:
         return ocr_words
 
@@ -753,10 +744,12 @@ def parse_json_response(text: str) -> dict:
 
     def normalize_result(data):
         if isinstance(data, list):
-            return {"boxes": data}
+            return {"items": data}
         return data
 
     def item_count(data) -> int:
+        if isinstance(data, list):
+            return len(data)
         if not isinstance(data, dict):
             return 0
         items = data.get("items")
@@ -835,6 +828,15 @@ def is_truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "yes", "1", "filled"}
     return False
+
+
+ANSWER_TYPES = {"answer", "underline", "box", "cloze_gap"}
+
+
+def is_answer_type(value: str | None) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in ANSWER_TYPES
 
 
 def inset_box(x: float, y: float, w: float, h: float, ratio: float) -> tuple[float, float, float, float]:
@@ -1186,8 +1188,7 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
     for index, raw in enumerate(raw_boxes, start=1):
         if not isinstance(raw, dict):
             continue
-        if is_truthy(raw.get("filled")) or is_truthy(raw.get("has_text")):
-            continue
+        filled = is_truthy(raw.get("filled")) or is_truthy(raw.get("has_text"))
 
         x = safe_float(raw.get("x"))
         y = safe_float(raw.get("y"))
@@ -1219,20 +1220,30 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         if w <= 0 or h <= 0:
             continue
 
-        box_type = str(raw.get("type", "answer")).strip().lower()
-        if box_type not in {"answer", "exercise"}:
-            box_type = "answer"
+        raw_type = str(raw.get("type", "")).strip().lower()
+        if raw_type in {"underline", "box", "cloze_gap"}:
+            box_type = raw_type
+        elif raw_type == "answer":
+            box_type = "underline"
+        elif raw_type == "exercise":
+            box_type = "exercise"
+        else:
+            box_type = "underline"
         label = str(raw.get("label", "")).strip()[:80]
-        answer_raw = raw.get("answer")
-        if answer_raw is None:
-            answer_raw = raw.get("label")
-        answer = str(answer_raw or "").strip()
-        if len(answer) > 160:
-            answer = answer[:160]
-        if box_type != "answer":
+        text_content = raw.get("text_content")
+        if text_content is None:
+            text_content = raw.get("answer")
+        if text_content is None:
+            text_content = raw.get("label")
+        answer = ""
+        if text_content is not None:
+            answer = str(text_content).strip()
+            if len(answer) > 160:
+                answer = answer[:160]
+        if not is_answer_type(box_type):
             answer = ""
 
-        if box_type == "answer":
+        if is_answer_type(box_type):
             x, y, w, h = inset_box(x, y, w, h, BOX_INSET_RATIO)
             if w <= 0 or h <= 0:
                 continue
@@ -1247,6 +1258,8 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
                 "h": h,
                 "label": label,
                 "answer": answer,
+                "text_content": answer or None,
+                "filled": filled,
                 "anchor": "",
             }
         )
@@ -1545,7 +1558,7 @@ def align_boxes_to_anchor_words(
 
     try:
         for box in boxes:
-            if box.get("type") != "answer":
+            if not is_answer_type(box.get("type")):
                 continue
             anchor_text = clean_anchor_text(str(box.get("anchor", "")).strip())
             if not anchor_text:
@@ -1669,7 +1682,7 @@ def generate_boxes(image: Image.Image) -> dict:
 def looks_filled_box(image: Image.Image, box: dict) -> bool:
     if not FILTER_FILLED_BOXES:
         return False
-    if box.get("type") != "answer":
+    if not is_answer_type(box.get("type")):
         return False
 
     width, height = image.size
@@ -1719,6 +1732,9 @@ def filter_filled_boxes(image: Image.Image, boxes: list[dict]) -> list[dict]:
 
     filtered = []
     for box in boxes:
+        if is_truthy(box.get("filled")):
+            filtered.append(box)
+            continue
         if looks_filled_box(image, box):
             continue
         filtered.append(box)

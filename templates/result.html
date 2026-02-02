@@ -84,6 +84,7 @@
                   {% endfor %}
                 </div>
               {% endif %}
+              {% set answer_types = ['answer', 'underline', 'box', 'cloze_gap'] %}
               {% for box in page.boxes %}
                 {% set left = (box.x * 100) | round(4) %}
                 {% set top = (box.y * 100) | round(4) %}
@@ -91,7 +92,7 @@
                 {% set height = (box.h * 100) | round(4) %}
                 {% set anchor = (box.anchor or '') | trim %}
                 {% set cv_steps = box.cv_debug_steps if cv_debug_enabled else none %}
-                {% if box.type == 'answer' %}
+                {% if box.type in answer_types %}
                   <div
                     class="answer-wrap"
                     style="left: {{ left }}%; top: {{ top }}%; width: {{ width }}%; height: {{ height }}%;"
