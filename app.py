@@ -145,47 +145,45 @@ CV_CAP_HEIGHT_MAX_SCALE = float(os.getenv("CV_CAP_HEIGHT_MAX_SCALE", "2.2"))
 CV_CAP_HEIGHT_MAX_SHIFT_RATIO = float(os.getenv("CV_CAP_HEIGHT_MAX_SHIFT_RATIO", "1.2"))
 
 PROMPT_TEMPLATE = """
-You are a Document Layout Analysis Engine. Your goal is to detect every user-fillable input field in the provided document image with pixel-perfect precision.
+Identify all **empty** user-fillable blanks on the page.
+Ignore any blank or line that already contains an answer (handwritten or printed), as these are examples.
 
-COORDINATE SYSTEM
-- Return 2D bounding boxes in normalized coordinates [ymin, xmin, ymax, xmax] relative to the image size.
-- Scale: 0-1000 (where 0 is top/left and 1000 is bottom/right).
+Coords: [ymin,xmin,ymax,xmax], relative to image, scale 0-1000.
 
-DETECTION RULES (STRICT)
+Rules:
+1. **Target Empty Fields Only:**
+   - Detect underlines, empty boxes, or gaps within text intended for user input.
+   - **CRITICAL EXCLUSION:** If a field contains ANY text (handwriting, typed text, or checkmarks), DO NOT create a box for it. Treat these as "Examples".
+   - Look for the "▶" symbol; lines associated with this symbol are almost always examples and must be ignored if filled.
 
-1. TARGET DEFINITION:
-   - Identify visual features intended for user input: underlines (____), empty boxes ([ ]), or logical gaps in text (cloze deletions like "h__r").
-   - Ignore purely decorative lines.
+2. **Vertical Alignment (Fix Floating):**
+   - **Anchor to Baseline:** The bottom edge (`ymax`) of your bounding box must touch the visible underline or the invisible text baseline. Do NOT let the box float above the line.
+   - **Height Expansion:** Do not limit height to the size of a lowercase letter. The box height must be **tall enough** to accommodate a capital letter or a handwritten letter with ascenders (e.g., 'h', 'l').
+   - **Minimum Height:** Ensure the box is vertically generous. If the visual underline is thin, the box should still extend upwards significantly to capture the writing space.
 
-2. VERTICAL ALIGNMENT (CRITICAL):
-   - The bottom edge (ymax) of your bounding box must align exactly with the visual baseline of the text line.
-   - Do NOT let the box "float" above the line.
-   - The height of the box should match the surrounding text's font size (approx. 120% of the character height) to encompass ascenders and descenders.
+3. **Horizontal Merging (Fix Fragmented Gaps):**
+   - In word puzzles (e.g., "c _ _ n"), if multiple underscores appear consecutively, **MERGE** them into one single bounding box.
+   - The box should define the entire "writeable zone" for that word segment.
 
-3. HORIZONTAL MERGING:
-   - Context: Hand-made forms often use broken lines (e.g., "_ _ _ _") to indicate a single long answer.
-   - Rule: If multiple underline segments or small gaps appear consecutively on the same line with no printed text between them, MERGE them into a single bounding box. Do not output fragmented boxes for a single answer field.
+4. **Horizontal Precision:**
+   - For gaps inside words (e.g., "wa___t"), extend the box width to touch the bounding box of the adjacent letters ('a' and 't'). Do not leave a "safety gap" of white space; the box should fill the void completely.
 
-4. HANDWRITING HANDLING:
-   - If a field contains handwriting:
-     - Set "filled": true.
-     - Bounding Logic: Your box should primarily bound the intended field area (the underline/box), NOT the messy handwriting strokes that might extend wildly up or down. Capture the logical space.
+5. **Multi-line handling:**
+   - If a blank spans multiple lines (a paragraph format), create separate boxes for each line segment.
 
-5. WORD COMPLETION (CLOZE) SPECIFIC:
-   - For gaps inside words (e.g., "w__st"), the box must span from the last printed letter's edge to the next printed letter's edge.
-   - Constraint: It is acceptable for the box edges to touch the bounding box of adjacent printed letters (pixel-tight), but do not obscure the printed letter itself.
+6. **Answer requirements:**
+   - If the field is empty, infer the answer only if it is explicitly deducible from the information on the page.
+   - Be extra atrentive to context, and task requrements of every exercise.
+   - If not deducible, set "text_content" to null.
+   - Think extra over every answer.
 
-OUTPUT SCHEMA (JSON ONLY)
-Respond with a raw JSON array. Do not include markdown formatting or explanations.
-
-[
-  {
-    "box_2d": [ymin, xmin, ymax, xmax],
-    "text_content": "The readable answer string inside the box (if filled) or inferred answer from context (if empty). Leave null if undeducible.",
-    "filled": boolean,
-    "type": "underline" | "box" | "cloze_gap"
-  }
-]
+Output format (JSON only, no markdown):
+Return a JSON array of objects. Each object must include:
+- "box_2d": [ymin, xmin, ymax, xmax] (integers, 0-1000)
+- "text_content": string or null
+- "filled": boolean
+- "type": "underline" | "box" | "cloze_gap"
+Return an empty array if no blanks are found.
 """.strip()
 
 RESPONSE_SCHEMA = {
@@ -203,7 +201,7 @@ RESPONSE_SCHEMA = {
             "filled": {"type": "boolean"},
             "type": {"type": "string", "enum": ["underline", "box", "cloze_gap"]},
         },
-        "required": ["box_2d", "filled", "type"],
+        "required": ["box_2d", "text_content", "filled", "type"],
     },
 }
 
@@ -1189,6 +1187,8 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         if not isinstance(raw, dict):
             continue
         filled = is_truthy(raw.get("filled")) or is_truthy(raw.get("has_text"))
+        if filled:
+            continue
 
         x = safe_float(raw.get("x"))
         y = safe_float(raw.get("y"))
@@ -1230,11 +1230,12 @@ def sanitize_boxes(raw_boxes, page_num: int, image_size: tuple[int, int] | None 
         else:
             box_type = "underline"
         label = str(raw.get("label", "")).strip()[:80]
-        text_content = raw.get("text_content")
-        if text_content is None:
+        if "text_content" in raw:
+            text_content = raw.get("text_content")
+        else:
             text_content = raw.get("answer")
-        if text_content is None:
-            text_content = raw.get("label")
+            if text_content is None:
+                text_content = raw.get("label")
         answer = ""
         if text_content is not None:
             answer = str(text_content).strip()
