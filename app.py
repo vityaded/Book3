@@ -53,6 +53,7 @@ GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.1"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
 GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "").strip().lower()
+GEMINI_RETRY_THINKING_LEVEL = os.getenv("GEMINI_RETRY_THINKING_LEVEL", "medium").strip().lower()
 GEMINI_CODE_EXECUTION = os.getenv("GEMINI_CODE_EXECUTION", "1") == "1"
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
@@ -186,6 +187,53 @@ Return a JSON array of objects. Each object must include:
 Return an empty array if no blanks are found.
 """.strip()
 
+PROMPT_TEMPLATE_WITH_KEYS = """
+You are given two images:
+- Image 1: the worksheet page with blanks (targets).
+- Image 2: an answer key page (source of answers).
+
+Identify all **empty** user-fillable blanks on Image 1.
+Ignore any blank or line that already contains an answer (handwritten or printed), as these are examples.
+DO NOT create boxes for Image 2.
+
+Coords: [ymin,xmin,ymax,xmax], relative to image, scale 0-1000.
+
+Rules:
+1. **Target Empty Fields Only:**
+   - Detect underlines, empty boxes, or gaps within text intended for user input.
+   - **CRITICAL EXCLUSION:** If a field contains ANY text (handwriting, typed text, or checkmarks), DO NOT create a box for it. Treat these as "Examples".
+   - Look for the "▶" symbol; lines associated with this symbol are almost always examples and must be ignored if filled.
+
+2. **Vertical Alignment (Fix Floating):**
+   - **Anchor to Baseline:** The bottom edge (`ymax`) of your bounding box must touch the visible underline or the invisible text baseline. Do NOT let the box float above the line.
+   - **Height Expansion:** Do not limit height to the size of a lowercase letter. The box height must be **tall enough** to accommodate a capital letter or a handwritten letter with ascenders (e.g., 'h', 'l').
+   - **Minimum Height:** Ensure the box is vertically generous. If the visual underline is thin, the box should still extend upwards significantly to capture the writing space.
+
+3. **Horizontal Merging (Fix Fragmented Gaps):**
+   - In word puzzles (e.g., "c _ _ n"), if multiple underscores appear consecutively, **MERGE** them into one single bounding box.
+   - The box should define the entire "writeable zone" for that word segment.
+
+4. **Horizontal Precision:**
+   - For gaps inside words (e.g., "wa___t"), extend the box width to touch the bounding box of the adjacent letters ('a' and 't'). Do not leave a "safety gap" of white space; the box should fill the void completely.
+
+5. **Multi-line handling:**
+   - If a blank spans multiple lines (a paragraph format), create separate boxes for each line segment.
+
+6. **Answer requirements (use keys first):**
+   - For each empty field on Image 1, find its answer on Image 2 (the keys) and set it as `text_content`.
+   - If the answer is not present on Image 2, infer the answer only if it is explicitly deducible from the information on Image 1.
+   - If not deducible, set "text_content" to null.
+   - Never invent answers.
+
+Output format (JSON only, no markdown):
+Return a JSON array of objects. Each object must include:
+- "box_2d": [ymin, xmin, ymax, xmax] (integers, 0-1000)
+- "text_content": string or null
+- "filled": boolean
+- "type": "underline" | "box" | "cloze_gap"
+Return an empty array if no blanks are found.
+""".strip()
+
 RESPONSE_SCHEMA = {
     "type": "array",
     "items": {
@@ -218,6 +266,12 @@ app.config["MAX_CONTENT_LENGTH"] = UPLOAD_MAX_MB * 1024 * 1024
 _cached_client = None
 
 
+class GeminiNoTextError(ValueError):
+    def __init__(self, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
 def allowed_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
 
@@ -228,6 +282,37 @@ def create_job_dirs(job_id: str) -> tuple[Path, Path]:
     job_dir.mkdir(parents=True, exist_ok=True)
     job_static.mkdir(parents=True, exist_ok=True)
     return job_dir, job_static
+
+
+def save_optional_keys_image(job_dir: Path, job_static: Path) -> tuple[Path | None, str | None]:
+    """Save an optional keys (answer key) image uploaded as `keys_image`.
+
+    Returns the PNG path and its static-relative path (e.g. jobs/<job_id>/keys.png).
+    """
+    keys_file = request.files.get("keys_image")
+    if not keys_file or not keys_file.filename:
+        return None, None
+
+    ext = Path(keys_file.filename).suffix.lower()
+    if ext == ".pdf":
+        raise ValueError("Keys must be an image (not PDF) for now.")
+    if not ext:
+        ext = ".png"
+
+    allowed_images = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    if ext not in allowed_images:
+        raise ValueError("Unsupported keys image format. Use PNG or JPEG.")
+
+    upload_path = job_dir / f"keys{ext}"
+    keys_file.save(upload_path)
+
+    try:
+        keys_png = convert_image_to_png(upload_path, job_static, output_name="keys.png")
+    except Exception as exc:
+        raise ValueError(f"Failed to read keys image: {exc}") from exc
+
+    job_id = job_static.name
+    return keys_png, f"jobs/{job_id}/{keys_png.name}"
 
 
 def render_pdf_to_images(pdf_path: Path, output_dir: Path) -> list[Path]:
@@ -494,10 +579,11 @@ def maybe_ocr_pdf(input_pdf: Path, job_dir: Path) -> Path:
         return input_pdf
 
 
-def convert_image_to_png(image_path: Path, output_dir: Path) -> Path:
-    image = Image.open(image_path).convert("RGB")
-    output_path = output_dir / "page_1.png"
-    image.save(output_path, format="PNG")
+def convert_image_to_png(image_path: Path, output_dir: Path, output_name: str = "page_1.png") -> Path:
+    output_path = output_dir / output_name
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        image.save(output_path, format="PNG")
     return output_path
 
 
@@ -1028,7 +1114,10 @@ def is_gemini_3_model(model_name: str | None) -> bool:
     return name.startswith("gemini-3")
 
 
-def build_generation_config(model_name: str | None = None):
+def build_generation_config(
+    model_name: str | None = None,
+    thinking_level_override: str | None = None,
+):
     model_name = model_name or GEMINI_MODEL
     config_kwargs = {
         "temperature": GEMINI_TEMPERATURE,
@@ -1051,9 +1140,14 @@ def build_generation_config(model_name: str | None = None):
 
     if types is not None and hasattr(types, "ThinkingConfig"):
         thinking_config = None
-        if GEMINI_THINKING_LEVEL and is_gemini_3_model(model_name):
+        thinking_level = None
+        if thinking_level_override is not None:
+            thinking_level = str(thinking_level_override).strip().lower() or None
+        else:
+            thinking_level = GEMINI_THINKING_LEVEL or None
+        if thinking_level and is_gemini_3_model(model_name):
             try:
-                thinking_config = types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL)
+                thinking_config = types.ThinkingConfig(thinking_level=thinking_level)
             except Exception:
                 thinking_config = None
         if thinking_config is None and GEMINI_THINKING_BUDGET >= 0:
@@ -1601,19 +1695,23 @@ def align_boxes_to_anchor_words(
             doc.close()
 
 
-def generate_boxes(image: Image.Image) -> dict:
+def generate_boxes(image: Image.Image, keys_image: Image.Image | None = None) -> dict:
     client = get_client()
-    prompt = PROMPT_TEMPLATE
+    prompt = PROMPT_TEMPLATE_WITH_KEYS if keys_image is not None else PROMPT_TEMPLATE
     config = build_generation_config()
-    contents = [image, prompt]
+    if keys_image is not None:
+        contents = ["Worksheet page:", image, "Answer key page:", keys_image, prompt]
+    else:
+        contents = [image, prompt]
 
     if GEMINI_DEBUG:
         logger.info(
-            "Gemini request: model=%s prompt_chars=%s image_size=%sx%s config=%s",
+            "Gemini request: model=%s prompt_chars=%s image_size=%sx%s keys=%s config=%s",
             GEMINI_MODEL,
             len(prompt),
             image.size[0],
             image.size[1],
+            "1" if keys_image is not None else "0",
             config,
         )
 
@@ -1643,8 +1741,9 @@ def generate_boxes(image: Image.Image) -> dict:
 
     text_candidates = extract_text_candidates(response)
     if not text_candidates:
+        first_summary = summarize_response(response)
         logger.error("Gemini response missing text parts.")
-        logger.error("Gemini response summary: %s", json.dumps(summarize_response(response), ensure_ascii=True))
+        logger.error("Gemini response summary: %s", json.dumps(first_summary, ensure_ascii=True))
         raw_json = None
         if hasattr(response, "model_dump"):
             try:
@@ -1663,7 +1762,67 @@ def generate_boxes(image: Image.Image) -> dict:
                 raw_json = None
         if raw_json:
             logger.error("Gemini response raw: %s", clip_text(raw_json, GEMINI_LOG_MAX_CHARS))
-        raise ValueError("Gemini returned no text parts; see logs for details.")
+
+        retry_thinking_level = GEMINI_RETRY_THINKING_LEVEL
+        logger.warning(
+            "Gemini response missing text parts; retrying with thinking_level=%s",
+            retry_thinking_level or "default",
+        )
+        retry_config = build_generation_config(thinking_level_override=retry_thinking_level)
+        retry_response = call_gemini_with_retries(client, contents, retry_config)
+
+        if GEMINI_DEBUG:
+            retry_summary = summarize_response(retry_response)
+            logger.info("Gemini retry response summary: %s", json.dumps(retry_summary, ensure_ascii=True))
+            retry_raw_json = None
+            if hasattr(retry_response, "model_dump"):
+                try:
+                    retry_raw_json = json.dumps(retry_response.model_dump(), ensure_ascii=True)
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json is None and hasattr(retry_response, "to_dict"):
+                try:
+                    retry_raw_json = json.dumps(retry_response.to_dict(), ensure_ascii=True)
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json is None and hasattr(retry_response, "to_json"):
+                try:
+                    retry_raw_json = retry_response.to_json()
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json:
+                logger.info("Gemini retry response raw: %s", clip_text(retry_raw_json, GEMINI_LOG_MAX_CHARS))
+
+        text_candidates = extract_text_candidates(retry_response)
+        if not text_candidates:
+            retry_summary = summarize_response(retry_response)
+            logger.error("Gemini retry response missing text parts.")
+            logger.error("Gemini retry response summary: %s", json.dumps(retry_summary, ensure_ascii=True))
+            retry_raw_json = None
+            if hasattr(retry_response, "model_dump"):
+                try:
+                    retry_raw_json = json.dumps(retry_response.model_dump(), ensure_ascii=True)
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json is None and hasattr(retry_response, "to_dict"):
+                try:
+                    retry_raw_json = json.dumps(retry_response.to_dict(), ensure_ascii=True)
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json is None and hasattr(retry_response, "to_json"):
+                try:
+                    retry_raw_json = retry_response.to_json()
+                except Exception:
+                    retry_raw_json = None
+            if retry_raw_json:
+                logger.error("Gemini retry response raw: %s", clip_text(retry_raw_json, GEMINI_LOG_MAX_CHARS))
+            details = {
+                "first": first_summary,
+                "retry": retry_summary,
+                "retry_thinking_level": retry_thinking_level,
+            }
+            raise GeminiNoTextError("Gemini returned no text parts; see logs for details.", details)
+        response = retry_response
 
     last_error = None
     for text in text_candidates:
@@ -1755,9 +1914,11 @@ def process_page(
     page_index: int,
     image_path: Path,
     pdf_path: Path | None = None,
+    keys_image_path: Path | None = None,
     cv_debug: bool = False,
 ) -> dict:
     error = ""
+    error_details = None
     boxes = []
     gemini_boxes = []
     ocr_debug = []
@@ -1768,7 +1929,13 @@ def process_page(
         llm_image = prepare_image_for_llm(image)
         llm_size = llm_image.size
         try:
-            raw_response = generate_boxes(llm_image)
+            keys_llm_image = None
+            if keys_image_path is not None and keys_image_path.exists():
+                with Image.open(keys_image_path) as keys_image:
+                    keys_image = keys_image.convert("RGB")
+                    keys_llm_image = prepare_image_for_llm(keys_image).copy()
+
+            raw_response = generate_boxes(llm_image, keys_image=keys_llm_image)
             raw_items = raw_response.get("items")
             if not isinstance(raw_items, list):
                 raw_items = raw_response.get("boxes", [])
@@ -1839,6 +2006,10 @@ def process_page(
                 if debug_used_pdf and pdf_path is not None:
                     ocr_debug_selected = refine_ocr_words_bbox_from_pdf(pdf_path, page_index, ocr_debug_selected)
                 ocr_debug = prepare_ocr_words_for_debug(ocr_debug_selected)
+        except GeminiNoTextError as exc:
+            logger.exception("Gemini failed on page %s", page_index)
+            error = str(exc)
+            error_details = exc.details
         except Exception as exc:
             logger.exception("Gemini failed on page %s", page_index)
             error = str(exc)
@@ -1859,7 +2030,7 @@ def process_page(
 
     strip_cv_internal_fields(boxes)
 
-    return {
+    page_payload = {
         "page": page_index,
         "image": f"jobs/{job_id}/{image_path.name}",
         "width": width,
@@ -1873,12 +2044,16 @@ def process_page(
         "cv_debug_step_labels": cv_debug_step_labels,
         "error": error,
     }
+    if error_details:
+        page_payload["error_details"] = error_details
+    return page_payload
 
 
 def process_images(
     job_id: str,
     image_paths: list[Path],
     pdf_path: Path | None = None,
+    keys_image_path: Path | None = None,
     cv_debug: bool = False,
 ) -> dict:
     pages = []
@@ -1895,6 +2070,7 @@ def process_images(
                         page_index,
                         image_path,
                         pdf_path,
+                        keys_image_path,
                         cv_debug=cv_debug,
                     )
                 )
@@ -1903,15 +2079,27 @@ def process_images(
         pages.sort(key=lambda page: page["page"])
     else:
         for page_index, image_path in enumerate(image_paths, start=1):
-            pages.append(process_page(job_id, page_index, image_path, pdf_path, cv_debug=cv_debug))
+            pages.append(
+                process_page(
+                    job_id,
+                    page_index,
+                    image_path,
+                    pdf_path,
+                    keys_image_path,
+                    cv_debug=cv_debug,
+                )
+            )
 
-    return {
+    payload = {
         "job_id": job_id,
         "model": GEMINI_MODEL,
         "debug_ocr": DEBUG_OCR_LAYER and not NO_OCR,
         "debug_cv": cv_debug,
         "pages": pages,
     }
+    if keys_image_path is not None:
+        payload["keys_image"] = f"jobs/{job_id}/{keys_image_path.name}"
+    return payload
 
 
 def save_result(job_dir: Path, result: dict) -> None:
@@ -2002,6 +2190,12 @@ def upload():
     upload_path = job_dir / f"upload{ext}"
     file.save(upload_path)
 
+    try:
+        keys_image_path, _keys_image_rel = save_optional_keys_image(job_dir, job_static)
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("index"))
+
     pdf_for_anchors = None
     try:
         if ext == ".pdf":
@@ -2015,7 +2209,13 @@ def upload():
         flash(f"Failed to process file: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths, pdf_path=pdf_for_anchors, cv_debug=cv_debug)
+    result = process_images(
+        job_id,
+        image_paths,
+        pdf_path=pdf_for_anchors,
+        keys_image_path=keys_image_path,
+        cv_debug=cv_debug,
+    )
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 
@@ -2043,12 +2243,18 @@ def paste():
     file.save(upload_path)
 
     try:
+        keys_image_path, _keys_image_rel = save_optional_keys_image(job_dir, job_static)
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("index"))
+
+    try:
         image_paths = [convert_image_to_png(upload_path, job_static)]
     except Exception as exc:
         flash(f"Failed to read clipboard image: {exc}")
         return redirect(url_for("index"))
 
-    result = process_images(job_id, image_paths, cv_debug=cv_debug)
+    result = process_images(job_id, image_paths, keys_image_path=keys_image_path, cv_debug=cv_debug)
     save_result(job_dir, result)
     return redirect(url_for("result", job_id=job_id))
 

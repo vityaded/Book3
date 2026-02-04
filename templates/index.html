@@ -42,8 +42,12 @@
           <h2>Upload PDF or image</h2>
           <p>Select a file and let Gemini handle the bounding boxes.</p>
           <form id="upload-form" action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-            <input id="cv-debug-hidden" type="hidden" name="cv_debug" value="0" />
+            <input id="cv-debug-hidden" data-cv-debug-hidden type="hidden" name="cv_debug" value="0" />
             <input class="file-input" type="file" name="file" accept="application/pdf,image/*" required />
+            <div class="divider">keys</div>
+            <div id="upload-keys-area" class="paste-area paste-area-keys" tabindex="0">Paste keys image here (optional)</div>
+            <img id="upload-keys-preview" class="paste-preview paste-preview-keys" alt="Keys preview" />
+            <p id="upload-keys-status" class="helper">Waiting for keys image.</p>
             <button class="button" type="submit">Process file</button>
           </form>
         </div>
@@ -55,8 +59,53 @@
           <img id="paste-preview" class="paste-preview" alt="Clipboard preview" />
           <div class="divider">clipboard</div>
           <p id="clipboard-status" class="helper">Waiting for clipboard image.</p>
+          <div class="divider">keys</div>
+          <div id="keys-paste-area" class="paste-area paste-area-keys" tabindex="0">Paste keys image here (optional)</div>
+          <img id="keys-preview" class="paste-preview paste-preview-keys" alt="Keys preview" />
+          <p id="keys-status" class="helper">Waiting for keys image.</p>
           <button id="paste-submit" class="button secondary" type="button" disabled>Process clipboard image</button>
         </div>
+      </section>
+
+      <section class="jobs">
+        <div class="jobs-header">
+          <h2>Recent jobs</h2>
+          <p class="helper">Open an existing job or re-run CV alignment on Gemini boxes.</p>
+        </div>
+        {% if jobs %}
+          <div class="job-list">
+            {% for job in jobs %}
+              <div class="job-item">
+                <div class="job-meta">
+                  <div class="job-title">
+                    <span class="badge">Job {{ job.job_id }}</span>
+                    {% if job.debug_cv %}
+                      <span class="badge debug">CV debug</span>
+                    {% endif %}
+                  </div>
+                  <div class="job-sub">
+                    <span>{{ job.pages }} page{% if job.pages != 1 %}s{% endif %}</span>
+                    {% if job.model %}<span>· {{ job.model }}</span>{% endif %}
+                    {% if job.updated_at_display %}<span>· {{ job.updated_at_display }}</span>{% endif %}
+                  </div>
+                </div>
+                <div class="job-actions">
+                  <a class="button secondary" href="{{ url_for('result', job_id=job.job_id) }}">Open</a>
+                  <form action="{{ url_for('redo_cv', job_id=job.job_id) }}" method="post">
+                    <input data-cv-debug-hidden type="hidden" name="cv_debug" value="0" />
+                    <button class="button" type="submit">Redo CV</button>
+                  </form>
+                  <a class="button secondary" href="{{ url_for('job_json', job_id=job.job_id) }}">JSON</a>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="card">
+            <h2>Recent jobs</h2>
+            <p class="helper">No jobs yet. Upload a file to get started.</p>
+          </div>
+        {% endif %}
       </section>
     </main>
 

@@ -17,7 +17,7 @@ pip install -r requirements.txt
 - macOS (Homebrew): `brew install ocrmypdf`
 - Ubuntu/Debian: `sudo apt-get install -y ocrmypdf`
 
-3. Add your Gemini key in `.env` (copy from `.env.example` if needed):
+3. Copy `.env.example` to `.env` and add your Gemini key:
 
 ```
 GEMINI_API_KEY=your_key_here
@@ -31,6 +31,10 @@ python app.py
 
 Open http://127.0.0.1:5000
 
+## Keys image (optional)
+
+On the upload screen, you can paste a separate "keys" / answer-key image. When provided, Gemini uses it as the source of truth for answers (`text_content`) instead of inventing them. For multi-page PDFs, the same keys image is reused for every page.
+
 ## Notes
 
 - `MAX_PAGES` limits PDF pages processed per upload.
@@ -41,7 +45,9 @@ Open http://127.0.0.1:5000
 - `BOX_COORDINATE_SCALE` controls how model box coordinates are normalized (`1000`, `auto`, or `px`).
 - `GEMINI_DEBUG` logs request/response summaries for troubleshooting blocked or empty replies.
 - `GEMINI_TEMPERATURE`, `GEMINI_TOP_P`, `GEMINI_MAX_OUTPUT_TOKENS` tune output stability and size.
-- `GEMINI_THINKING_BUDGET=0` minimizes latency; raise it if accuracy drops.
+- `GEMINI_THINKING_LEVEL` controls Gemini 3 reasoning (`minimal`, `low`, `medium`, `high`).
+- `GEMINI_RETRY_THINKING_LEVEL` sets the one-time retry thinking level when Gemini returns no text parts (default `medium`).
+- `GEMINI_THINKING_BUDGET=0` is the legacy Gemini 2.5 knob; avoid setting both.
 - `GEMINI_TIMEOUT_SEC`, `GEMINI_MAX_RETRIES`, `GEMINI_RETRY_BACKOFF_SEC` control request timeouts and retries.
 - `GEMINI_FALLBACK_MODEL` lets you auto-retry with a backup model when the primary fails.
 - PDF uploads are OCR’d with `ocrmypdf` before page rendering (requires OCRmyPDF + Tesseract + Ghostscript).
@@ -78,3 +84,4 @@ Open http://127.0.0.1:5000
 - `ANCHOR_LINE_DY_MAX`, `ANCHOR_LINE_DY_MIN`, `ANCHOR_LINE_DY_MULT` restrict anchor matching to OCR lines near the original box (prevents snapping to the same word far away).
 - If OCR fails, anchor snapping is skipped and Gemini coordinates are used as-is.
 - Results are saved under `data/jobs` and images under `static/jobs`.
+- When a no-text Gemini response persists after the retry, `result.json` includes `error_details` for diagnostics.

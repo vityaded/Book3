@@ -11,6 +11,13 @@ env/
 # Environment variables
 .env
 .env.*
+!.env.example
+
+# Local assets (do not commit)
+examples/*.pdf
+manual_jsons/
+manual_process/renders/
+scripts/
 
 # Tooling caches and test artifacts
 .pytest_cache/

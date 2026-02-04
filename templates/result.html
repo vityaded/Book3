@@ -57,6 +57,9 @@
               {% if page.error %}
                 <span class="error">{{ page.error }}</span>
               {% endif %}
+              <span class="page-scoreboard" aria-live="polite">
+                Score <span data-score-current>0</span>/<span data-score-total>0</span>
+              </span>
             </div>
           </div>
           {% if cv_debug_enabled %}

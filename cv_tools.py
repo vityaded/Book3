@@ -377,7 +377,8 @@ def fix_box_overlaps_with_vision(
     for box in box_list:
         if not isinstance(box, dict):
             continue
-        if box.get("type") not in {None, "answer"}:
+        box_type = str(box.get("type") or "").strip().lower()
+        if box_type and box_type not in {"answer", "underline", "box", "cloze_gap"}:
             continue
 
         bounds = _normalized_box_to_pixels(box, width, height)
